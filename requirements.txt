@@ -1,0 +1,67 @@
+# Core dependencies
+fastapi>=0.103.1
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.1
+openai>=1.0.0
+httpx>=0.24.0
+
+# Vector database and embeddings
+# faiss-cpu==1.7.4  # Temporarily disable to avoid build errors
+# chromadb==0.4.18 # Temporarily disable to avoid hnswlib build errors
+rank_bm25>=0.2.2
+qdrant-client>=1.7.0
+
+# RAG framework
+langchain>=0.0.329
+langchain-openai>=0.0.2
+langchain-community>=0.0.16
+langchain-core>=0.1.15
+langchain-text-splitters>=0.0.1
+langchain-qdrant>=0.0.1
+# langchain-chroma>=0.0.1 # Also disable if chromadb is disabled
+
+# Web search
+tavily-python>=0.2.2
+
+# Document processing
+pypdf>=3.0.0
+python-docx>=0.8.11
+bs4>=0.0.1
+html2text>=2020.1.16
+unstructured>=0.10.30
+
+# Cloud storage
+boto3>=1.28.0
+
+# Async processing
+aiohttp>=3.8.0
+aiofiles>=23.1.0
+
+# Text processing
+tiktoken>=0.5.0
+beautifulsoup4>=4.11.0
+lxml>=4.9.0
+requests>=2.28.0
+scikit-learn>=1.0.0
+
+# Performance optimization
+pydantic>=2.0.0
+uvicorn[standard]>=0.23.0
+asyncio>=3.4.3
+
+# Utility
+tqdm>=4.64.0
+tenacity>=8.2.0
+
+# Multiple LLM providers
+anthropic>=0.8.0  # For Claude models
+google-generativeai>=0.3.0  # For Gemini models
+groq>=0.4.0  # For Groq API (Llama models)
+
+# Optional - uncomment if needed
+# llama-cpp-python>=0.2.0  # Uncomment if using local Llama models
+
+# Retry utilities for API rate limits
+tenacity>=8.2.0
