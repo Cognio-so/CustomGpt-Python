@@ -23,7 +23,7 @@ app = FastAPI(title="Enhanced RAG API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["https://agt-tester-frontend.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
@@ -488,7 +488,7 @@ if __name__ == "__main__":
     print("Starting RAG API server...")
     print(f"Local data base path: {os.path.abspath(LOCAL_DATA_BASE_PATH)}")
     print(f"OpenAI API Key Loaded: {'Yes' if os.getenv('OPENAI_API_KEY') else 'No - Set OPENAI_API_KEY'}")
-    print(f"CORS Origins: {os.getenv('CORS_ALLOWED_ORIGINS', '[\"http://localhost:5173\"]')}")
+    print(f"CORS Origins: {os.getenv('CORS_ALLOWED_ORIGINS', '["http://localhost:5173", "https://agt-tester-frontend.vercel.app"]')}")
     
     uvicorn.run(
         "main_rag_app:app",
