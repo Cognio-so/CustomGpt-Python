@@ -216,7 +216,7 @@ async def setup_gpt_context_endpoint(request: GptContextSetupRequest, background
             "gpt_id": request.gpt_id
         })
 
-@app.post("/upload-documents", summary="Upload documents (KB or User-specific)")
+@app.post("/upload-documents", summary="Upload documents (KB or User-specific) including images")
 async def upload_documents_endpoint(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
@@ -229,6 +229,18 @@ async def upload_documents_endpoint(
     r2_keys_or_urls_for_indexing: List[str] = []
 
     for file_upload in files:
+        # Check if it's an image file
+        filename = file_upload.filename
+        is_image = False
+        if filename:
+            _, ext = os.path.splitext(filename)
+            ext = ext.lower()
+            is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+            
+        # Log file type
+        if is_image:
+            print(f"Processing image file: {filename}")
+        
         result = await _process_uploaded_file_to_r2(file_upload, is_user_doc_bool)
         processing_results.append(result)
         if result.status == "success" and result.stored_url_or_key:
@@ -390,7 +402,7 @@ async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: Backg
         print(f"Error in gpt-opened endpoint: {e}")
         return {"success": False, "error": str(e)}
 
-@app.post("/upload-chat-files", summary="Upload files for chat")
+@app.post("/upload-chat-files", summary="Upload files for chat including images")
 async def upload_chat_files_endpoint(
     files: List[UploadFile] = File(...),
     user_email: str = Form(...),
@@ -409,6 +421,18 @@ async def upload_chat_files_endpoint(
     file_urls = []
 
     for file_upload in files:
+        # Check if it's an image file
+        filename = file_upload.filename
+        is_image = False
+        if filename:
+            _, ext = os.path.splitext(filename)
+            ext = ext.lower()
+            is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+            
+        # Log file type
+        if is_image:
+            print(f"Processing image file for chat: {filename}")
+            
         result = await _process_uploaded_file_to_r2(file_upload, is_user_doc_bool)
         if result.status == "success" and result.stored_url_or_key:
             file_urls.append(result.stored_url_or_key)

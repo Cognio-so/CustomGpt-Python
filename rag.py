@@ -3,6 +3,7 @@ import shutil
 import asyncio
 import time
 import json
+import base64
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union
 from urllib.parse import urlparse
 import uuid
@@ -27,6 +28,15 @@ from langchain_community.document_loaders import (
     PyPDFLoader, Docx2txtLoader, BSHTMLLoader, TextLoader, UnstructuredURLLoader
 )
 from langchain_community.document_transformers import Html2TextTransformer
+
+# Add import for image processing
+try:
+    from PIL import Image
+    from io import BytesIO
+    IMAGE_PROCESSING_AVAILABLE = True
+except ImportError:
+    IMAGE_PROCESSING_AVAILABLE = False
+    print("PIL not found. Install with: pip install pillow")
 
 # Web Search (Tavily)
 try:
@@ -89,6 +99,9 @@ load_dotenv()
 QDRANT_VECTOR_PARAMS = qdrant_models.VectorParams(size=1536, distance=qdrant_models.Distance.COSINE)
 CONTENT_PAYLOAD_KEY = "page_content"
 METADATA_PAYLOAD_KEY = "metadata"
+
+if os.name == 'nt':  # Windows
+    pass
 
 class EnhancedRAG:
     def __init__(
@@ -212,6 +225,26 @@ class EnhancedRAG:
         if GROQ_AVAILABLE and self.groq_api_key:
             self.groq_client = AsyncGroq(api_key=self.groq_api_key)
             print(f"✅ Groq client initialized successfully")
+        
+        # Update vision capability detection to match the new model list
+        self.has_vision_capability = default_llm_model_name in [
+            "gpt-4o", 
+            "gpt-4o-mini", 
+            "gemini-flash-2.5", 
+            "gemini-pro-2.5",
+            "claude-3.5-haiku"
+        ]
+        
+        # Track if this model is a Gemini model (for vision processing)
+        self.is_gemini_model = default_llm_model_name in ["gemini-flash-2.5", "gemini-pro-2.5"]
+        
+        if self.has_vision_capability:
+            if self.is_gemini_model:
+                print(f"✅ Vision capabilities available with Gemini model: {default_llm_model_name}")
+            else:
+                print(f"✅ Vision capabilities available with model: {default_llm_model_name}")
+        else:
+            print(f"⚠️ Model {default_llm_model_name} may not support vision capabilities. Image processing may be limited.")
     
     def _get_user_qdrant_collection_name(self, session_id: str) -> str:
         safe_session_id = "".join(c if c.isalnum() else '_' for c in session_id)
@@ -301,15 +334,70 @@ class EnhancedRAG:
                 if not download_success: print(f"Failed R2 download: {r2_object_key_to_download}"); return []
 
                 _, ext = os.path.splitext(temp_file_path); ext = ext.lower()
-                loader: Any = None
-                if ext == ".pdf": loader = PyPDFLoader(temp_file_path)
-                elif ext == ".docx": loader = Docx2txtLoader(temp_file_path)
-                elif ext in [".html", ".htm"]: loader = BSHTMLLoader(temp_file_path, open_encoding='utf-8')
-                else: loader = TextLoader(temp_file_path, autodetect_encoding=True)
                 
-                loaded_docs = await asyncio.to_thread(loader.load)
-                if ext in [".html", ".htm"] and loaded_docs:
-                    loaded_docs = self.html_transformer.transform_documents(loaded_docs)
+                print(f"Processing file with extension: {ext}")
+                
+                # Check if it's an image file by extension
+                is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+                if is_image:
+                    print(f"Detected image file: {temp_file_path}")
+                    
+                    # Try to process the image with multiple approaches
+                    try:
+                        # Read the image file as bytes
+                        with open(temp_file_path, 'rb') as img_file:
+                            image_data = img_file.read()
+                        
+                        # First attempt: Use the current model with vision capabilities
+                        print(f"Processing image using {self.default_llm_model_name} vision capabilities...")
+                        image_content = await self._process_image_with_vision(image_data)
+                        
+                        if image_content:
+                            # Create a document from the description
+                            doc = Document(
+                                page_content=image_content,
+                                metadata={
+                                    "source": r2_key_or_url,
+                                    "file_type": "image",
+                                    "content_source": "vision_api"
+                                }
+                            )
+                            loaded_docs = [doc]
+                            print(f"Successfully processed image with vision API, extracted {len(image_content)} characters")
+                        else:
+                            # Create a default document if no content was extracted
+                            doc = Document(
+                                page_content="[This is an image file that couldn't be processed. Please ask specific questions about its content.]",
+                                metadata={"source": r2_key_or_url, "file_type": "image"}
+                            )
+                            loaded_docs = [doc]
+                    except Exception as e_img:
+                        print(f"All image processing methods failed: {e_img}")
+                        # Create a fallback document
+                        doc = Document(
+                            page_content="[This is an image file that could not be automatically analyzed. Please ask specific questions about what you're looking for in this image.]",
+                            metadata={"source": r2_key_or_url, "file_type": "image", "processing_error": str(e_img)}
+                        )
+                        loaded_docs = [doc]
+                else:
+                    # Handle regular document types
+                    loader = None
+                    try:
+                        if ext == ".pdf": 
+                            loader = PyPDFLoader(temp_file_path)
+                        elif ext == ".docx": 
+                            loader = Docx2txtLoader(temp_file_path)
+                        elif ext in [".html", ".htm"]: 
+                            loader = BSHTMLLoader(temp_file_path, open_encoding='utf-8')
+                        else: 
+                            loader = TextLoader(temp_file_path, autodetect_encoding=True)
+                        
+                        loaded_docs = await asyncio.to_thread(loader.load)
+                        if ext in [".html", ".htm"] and loaded_docs:
+                            loaded_docs = self.html_transformer.transform_documents(loaded_docs)
+                    except Exception as e_load:
+                        print(f"Error loading document: {e_load}")
+                        return []
             
             if loaded_docs:
                 for doc in loaded_docs:
@@ -323,7 +411,81 @@ class EnhancedRAG:
             if os.path.exists(temp_file_path):
                 try: os.remove(temp_file_path)
                 except Exception as e_del: print(f"Error deleting temp file {temp_file_path}: {e_del}")
-    
+
+    async def _process_image_with_vision(self, image_data: bytes) -> str:
+        """Process an image using the user's chosen model with vision capabilities"""
+        try:
+            # Convert image to base64
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            if self.is_gemini_model and GEMINI_AVAILABLE and self.gemini_client:
+                print(f"Using {self.default_llm_model_name} for image processing")
+                try:
+                    # Map Gemini model names
+                    gemini_model_name = "gemini-pro-vision"  # Default fallback for vision
+                    if self.default_llm_model_name == "gemini-flash-2.5":
+                        gemini_model_name = "gemini-2.5-flash-preview-04-17"
+                    elif self.default_llm_model_name == "gemini-pro-2.5":
+                        gemini_model_name = "gemini-2.5-pro-preview-05-06"
+                    
+                    # Process with Gemini Vision
+                    image_parts = [{"mime_type": "image/jpeg", "data": base64_image}]
+                    prompt_text = "Describe the content of this image in detail, including any visible text."
+                    
+                    model = self.gemini_client.GenerativeModel(gemini_model_name)
+                    response = await model.generate_content_async(contents=[prompt_text] + image_parts)
+                    
+                    if hasattr(response, "text"):
+                        return f"Image Content ({self.default_llm_model_name} Analysis):\n{response.text}"
+                except Exception as e_gemini:
+                    print(f"Error with Gemini Vision: {e_gemini}")
+            
+            # Use OpenAI or Claude if not using Gemini
+            if self.default_llm_model_name.startswith("gpt-"):
+                model = self.default_llm_model_name  # Use the actual configured model
+                response = await self.async_openai_client.chat.completions.create(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }],
+                    max_tokens=4000
+                )
+                return f"Image Content ({model} Analysis):\n{response.choices[0].message.content}"
+            
+            elif self.default_llm_model_name.startswith("claude") and CLAUDE_AVAILABLE:
+                model = "claude-3.5-haiku-20240307"  # Use exact model ID with version
+                response = await self.anthropic_client.messages.create(
+                    model=model,
+                    messages=[{
+                        "role": "user", 
+                        "content": [
+                            {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image}}
+                        ]
+                    }],
+                    max_tokens=4000
+                )
+                return f"Image Content ({model} Analysis):\n{response.content[0].text}"
+            
+            # Fallback to basic image analysis if model has no vision capabilities
+            raise Exception(f"Model {self.default_llm_model_name} doesn't support vision capabilities")
+            
+        except Exception as e:
+            print(f"Error using Vision API: {e}")
+            # Basic image properties fallback
+            try:
+                img = Image.open(BytesIO(image_data))
+                width, height = img.size
+                format_type = img.format
+                mode = img.mode
+                return f"[Image file: {width}x{height} {format_type} in {mode} mode]"
+            except Exception as e_img:
+                return "[Image file detected but couldn't be processed]"
+
     async def _index_documents_to_qdrant_batch(self, docs_to_index: List[Document], collection_name: str):
         if not docs_to_index: return
 
@@ -557,20 +719,32 @@ class EnhancedRAG:
         system_prompt_override: Optional[str], stream: bool = False
     ) -> Union[AsyncGenerator[str, None], str]:
         current_llm_model = llm_model_name_override or self.default_llm_model_name
+        
+        # Normalize model names for consistent matching
+        normalized_model = current_llm_model.lower().strip()
+        
+        # Convert variations to canonical model names
+        if "llama 4" in normalized_model or "llama-4" in normalized_model:
+            current_llm_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        elif "llama" in normalized_model and "3" in normalized_model:
+            current_llm_model = "llama3-8b-8192"
+        elif "gemini" in normalized_model and "flash" in normalized_model:
+            current_llm_model = "gemini-flash-2.5"
+        elif "gemini" in normalized_model and "pro" in normalized_model:
+            current_llm_model = "gemini-pro-2.5"
+        elif "claude" in normalized_model:
+            current_llm_model = "claude-3.5-haiku-20240307"  # Use exact model ID with version
+        elif normalized_model == "gpt-4o" or normalized_model == "gpt-4o-mini":
+            current_llm_model = normalized_model  # Keep as is for OpenAI models
+        
         current_system_prompt = system_prompt_override or self.default_system_prompt
         
-        # Remove all base_model_type detection and context limit logic
-        # Deleted: base_model_type detection, token calculation, etc.
-        
-        # Remove web search detection for context limits
-        # Deleted: has_web_results detection
-        
-        # Continue with simplified code...
+        # Format context and query
         context_str = self._format_docs_for_llm_context(all_context_docs, "Retrieved Context")
         if not context_str.strip():
             context_str = "No relevant context could be found from any available source for this query. Please ensure documents are uploaded and relevant to your question."
 
-        # Enhanced user message with stronger formatting guidance
+        # Prepare user message
         user_query_message_content = (
             f"📚 **CONTEXT:**\n{context_str}\n\n"
             f"Based on the above context and any relevant chat history, provide a detailed, well-structured response to this query:\n\n"
@@ -591,16 +765,13 @@ class EnhancedRAG:
 
         user_memory = await self._get_user_memory(session_id)
         
-        # Determine which provider to use based on model name prefix
+        # GPT-4o or GPT-4o-mini models (OpenAI)
         if current_llm_model.startswith("gpt-"):
-            # Use OpenAI (existing implementation)
+            # Implementation for OpenAI models (stream and non-stream)
             if stream:
                 async def stream_generator():
                     full_response_content = ""
-                    print("Stream generator started")
                     try:
-                        print(f"Starting OpenAI stream with model: {current_llm_model}")
-                        # Always use full context, no model-specific handling
                         response_stream = await self.async_openai_client.chat.completions.create(
                             model=current_llm_model, 
                             messages=messages, 
@@ -611,18 +782,12 @@ class EnhancedRAG:
                         async for chunk in response_stream:
                             content_piece = chunk.choices[0].delta.content
                             if content_piece:
-                                print(f"Stream chunk received: {content_piece[:20]}...")
                                 full_response_content += content_piece
                                 yield content_piece
-                        
-                        print(f"Stream complete, total response length: {len(full_response_content)}")
                     except Exception as e_stream:
-                        # Pass errors straight through
                         print(f"Error during streaming: {e_stream}")
-                        # Don't show error to user
                         yield f"I apologize, but I couldn't process your request successfully. Please try asking in a different way."
                     finally:
-                        print(f"Saving response to memory, length: {len(full_response_content)}")
                         await asyncio.to_thread(user_memory.add_user_message, query)
                         await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
                 return stream_generator()
@@ -642,30 +807,28 @@ class EnhancedRAG:
                 await asyncio.to_thread(user_memory.add_ai_message, response_content)
                 return response_content
         
+        # Claude 3.5 Haiku
         elif current_llm_model.startswith("claude") and CLAUDE_AVAILABLE and self.anthropic_client:
-            # Use Claude implementation
             if stream:
                 async def claude_stream_generator():
                     full_response_content = ""
                     try:
-                        # Format messages for Claude - system message needs special handling
                         system_content = current_system_prompt
                         claude_messages = []
                         
-                        # Extract regular messages (not system)
                         for msg in chat_history_messages:
                             if msg["role"] != "system":
                                 claude_messages.append(msg)
                         
-                        # Add user query
                         claude_messages.append({"role": "user", "content": user_query_message_content})
                         
-                        # Claude streaming call with system as a separate parameter
+                        # Use the updated Claude model
                         response_stream = await self.anthropic_client.messages.create(
-                            model="claude-3-opus-20240229" if "claude" == current_llm_model else current_llm_model,
-                            system=system_content,  # System as a separate parameter
-                            messages=claude_messages,  # Without system message in the array
-                            stream=True
+                            model="claude-3.5-haiku-20240307",  # Use the exact model ID including version
+                            system=system_content,
+                            messages=claude_messages,
+                            stream=True,
+                            max_tokens=4000
                         )
                         
                         async for chunk in response_stream:
@@ -685,23 +848,21 @@ class EnhancedRAG:
                 # Non-streaming Claude implementation
                 response_content = ""
                 try:
-                    # Format messages for Claude - system message needs special handling
                     system_content = current_system_prompt
                     claude_messages = []
                     
-                    # Extract regular messages (not system)
                     for msg in chat_history_messages:
                         if msg["role"] != "system":
                             claude_messages.append(msg)
                     
-                    # Add user query
                     claude_messages.append({"role": "user", "content": user_query_message_content})
                     
-                    # Claude API call with system as a separate parameter
+                    # Use the updated Claude model
                     response = await self.anthropic_client.messages.create(
-                        model="claude-3-opus-20240229" if "claude" == current_llm_model else current_llm_model,
-                        system=system_content,  # System as a separate parameter
-                        messages=claude_messages  # Without system message in the array
+                        model="claude-3.5-haiku-20240307",  # Use the exact model ID including version
+                        system=system_content,
+                        messages=claude_messages,
+                        max_tokens=4000
                     )
                     response_content = response.content[0].text
                 except Exception as e_nostream:
@@ -712,8 +873,8 @@ class EnhancedRAG:
                 await asyncio.to_thread(user_memory.add_ai_message, response_content)
                 return response_content
         
+        # Gemini models (flash-2.5 and pro-2.5)
         elif current_llm_model.startswith("gemini") and GEMINI_AVAILABLE and self.gemini_client:
-            # Implement Gemini client call
             if stream:
                 async def gemini_stream_generator():
                     full_response_content = ""
@@ -722,7 +883,6 @@ class EnhancedRAG:
                         gemini_messages = []
                         for msg in messages:
                             if msg["role"] == "system":
-                                # Prepend system message to first user message
                                 continue
                             elif msg["role"] == "user":
                                 gemini_messages.append({"role": "user", "parts": [{"text": msg["content"]}]})
@@ -732,14 +892,18 @@ class EnhancedRAG:
                         # Add system message to first user message if needed
                         if messages[0]["role"] == "system" and len(gemini_messages) > 0:
                             for i, msg in enumerate(gemini_messages):
-                                if msg["role"] == "user":
-                                    gemini_messages[i]["parts"][0]["text"] = f"{messages[0]['content']}\n\n{gemini_messages[i]['parts'][0]['text']}"
+                                if msg["role"] == "user" and (not msg["parts"] or not msg["parts"][0].get("text")):
+                                    msg["parts"][0]["text"] = "Please provide information based on the context."
                                     break
                         
-                        # Always use gemini-1.5-flash regardless of the specific gemini model requested
-                        # This model has higher quotas and better rate limits
-                        model = self.gemini_client.GenerativeModel(model_name="gemini-1.5-flash")
-                        print(f"Using gemini-1.5-flash with higher quotas")
+                        # Map to the specific Gemini model version with exact identifiers
+                        gemini_model_name = current_llm_model
+                        if current_llm_model == "gemini-flash-2.5":
+                            gemini_model_name = "gemini-2.5-flash-preview-04-17"
+                        elif current_llm_model == "gemini-pro-2.5":
+                            gemini_model_name = "gemini-2.5-pro-preview-05-06"
+                            
+                        model = self.gemini_client.GenerativeModel(model_name=gemini_model_name)
                         
                         response_stream = await model.generate_content_async(
                             gemini_messages,
@@ -756,112 +920,90 @@ class EnhancedRAG:
                         
                     except Exception as e_stream:
                         print(f"Gemini streaming error: {e_stream}")
-                        # If we still hit rate limits, fall back to OpenAI
-                        if "429" in str(e_stream) or "quota" in str(e_stream).lower():
-                            print("Gemini encountered an issue, switching to OpenAI")
+                        if "429" in str(e_stream) and "quota" in str(e_stream).lower():
+                            yield "I apologize, but the Gemini service is currently rate limited. The system will automatically fall back to GPT-4o."
+                            # Fall back to GPT-4o silently
                             try:
-                                yield "\nSwitching to alternative AI model...\n\n"
-                                fallback_stream = await self.async_openai_client.chat.completions.create(
-                                    model="gpt-4o-mini",
+                                response_stream = await self.async_openai_client.chat.completions.create(
+                                    model="gpt-4o", 
                                     messages=messages, 
                                     temperature=self.default_temperature,
                                     stream=True
                                 )
                                 
-                                async for chunk in fallback_stream:
+                                async for chunk in response_stream:
                                     content_piece = chunk.choices[0].delta.content
                                     if content_piece:
                                         full_response_content += content_piece
                                         yield content_piece
-                            except Exception as fallback_error:
-                                yield "I apologize, but I couldn't process your request. Please try again later."
+                            except Exception as fallback_e:
+                                print(f"Gemini fallback error: {fallback_e}")
+                                yield "I apologize, but I couldn't process your request successfully. Please try again later."
                         else:
-                            yield f"\n[Error: {str(e_stream)}]\n"
+                            yield "I apologize, but I couldn't process your request successfully. Please try again later."
                     finally:
                         await asyncio.to_thread(user_memory.add_user_message, query)
                         await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
                 return gemini_stream_generator()
-        
-        elif current_llm_model.startswith("llama") and LLAMA_AVAILABLE and self.llama_model:
-            # Implement Llama model call (local)
-            if stream:
-                async def llama_stream_generator():
-                    full_response_content = ""
-                    try:
-                        # Format prompt for Llama
-                        prompt = f"<s>[INST] {current_system_prompt}\n\n"
-                        for msg in chat_history_messages:
-                            role = msg["role"]
-                            content = msg["content"]
-                            if role == "user":
-                                prompt += f"{content} [/INST]\n"
-                            else:
-                                prompt += f"{content} </s><s>[INST] "
-                        
-                        prompt += f"{user_query_message_content} [/INST]\n"
-                        
-                        # Call Llama in a thread to not block async
-                        loop = asyncio.get_event_loop()
-                        result = await loop.run_in_executor(
-                            None, 
-                            lambda: self.llama_model.create_completion(
-                                prompt=prompt,
-                                temperature=self.default_temperature,
-                                stream=True
-                            )
-                        )
-                        
-                        for chunk in result:
-                            if "text" in chunk:
-                                content_piece = chunk["text"]
-                                full_response_content += content_piece
-                                yield content_piece
-                        
-                    except Exception as e_stream:
-                        print(f"Llama streaming error: {e_stream}")
-                        yield f"\n[Error: {str(e_stream)}]\n"
-                    finally:
-                        await asyncio.to_thread(user_memory.add_user_message, query)
-                        await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
-                return llama_stream_generator()
             else:
+                # Non-streaming Gemini implementation
                 response_content = ""
                 try:
-                    # Format prompt for Llama (similar to above)
-                    prompt = f"<s>[INST] {current_system_prompt}\n\n"
-                    for msg in chat_history_messages:
-                        role = msg["role"]
-                        content = msg["content"]
-                        if role == "user":
-                            prompt += f"{content} [/INST]\n"
-                        else:
-                            prompt += f"{content} </s><s>[INST] "
+                    # Convert messages to Gemini format
+                    gemini_messages = []
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            continue
+                        elif msg["role"] == "user":
+                            gemini_messages.append({"role": "user", "parts": [{"text": msg["content"]}]})
+                        elif msg["role"] == "assistant":
+                            gemini_messages.append({"role": "model", "parts": [{"text": msg["content"]}]})
                     
-                    prompt += f"{user_query_message_content} [/INST]\n"
+                    # Add system message to first user message if needed
+                    if messages[0]["role"] == "system" and len(gemini_messages) > 0:
+                        for i, msg in enumerate(gemini_messages):
+                            if msg["role"] == "user" and (not msg["parts"] or not msg["parts"][0].get("text")):
+                                msg["parts"][0]["text"] = "Please provide information based on the context."
+                                break
                     
-                    # Call Llama in a thread to not block async
-                    loop = asyncio.get_event_loop()
-                    result = await loop.run_in_executor(
-                        None, 
-                        lambda: self.llama_model.create_completion(
-                            prompt=prompt,
-                            temperature=self.default_temperature,
-                            stream=False
-                        )
+                    # Map to the specific Gemini model version with exact identifiers
+                    gemini_model_name = current_llm_model
+                    if current_llm_model == "gemini-flash-2.5":
+                        gemini_model_name = "gemini-2.5-flash-preview-04-17"
+                    elif current_llm_model == "gemini-pro-2.5":
+                        gemini_model_name = "gemini-2.5-pro-preview-05-06"
+                    
+                    model = self.gemini_client.GenerativeModel(model_name=gemini_model_name)
+                    response = await model.generate_content_async(
+                        gemini_messages,
+                        generation_config={"temperature": self.default_temperature}
                     )
                     
-                    response_content = result["text"] if "text" in result else ""
+                    if hasattr(response, "text"):
+                        response_content = response.text
+                    else:
+                        response_content = "Error: Could not generate response from Gemini."
                 except Exception as e_nostream:
-                    print(f"Llama non-streaming error: {e_nostream}")
+                    print(f"Gemini non-streaming error: {e_nostream}")
                     response_content = f"Error: {str(e_nostream)}"
                 
                 await asyncio.to_thread(user_memory.add_user_message, query)
                 await asyncio.to_thread(user_memory.add_ai_message, response_content)
                 return response_content
         
-        elif current_llm_model.startswith("llama") and GROQ_AVAILABLE and self.groq_client:
-            # Map "llama" to Groq's Llama model
-            groq_model = "llama3-8b-8192"  # Using a model that exists in Groq
+        # Llama models (Llama 3 and Llama 4 Scout via Groq)
+        elif (current_llm_model.startswith("llama") or current_llm_model.startswith("meta-llama/")) and GROQ_AVAILABLE and self.groq_client:
+            # Map to the specific Llama model with more robust name matching
+            groq_model = "llama3-8b-8192"  # Default for Llama 3
+            
+            # Handle different variations of Llama 4 Scout name
+            if "llama 4" in current_llm_model.lower() or "llama-4" in current_llm_model.lower() or current_llm_model.startswith("meta-llama/llama-4"):
+                # Use a model that actually exists in Groq as fallback
+                groq_model = "llama3-70b-8192"  # Higher quality Llama model available on Groq
+                print(f"Using Groq with llama3-70b-8192 model (as fallback for Llama 4 Scout)")
+            else:
+                groq_model = "llama3-8b-8192"  # Keep default for Llama 3
+                print(f"Using Groq with llama3-8b-8192 model")
             
             if stream:
                 async def groq_stream_generator():
@@ -883,10 +1025,10 @@ class EnhancedRAG:
                             if content_piece:
                                 full_response_content += content_piece
                                 yield content_piece
-            
+                
                     except Exception as e_stream:
                         print(f"Groq streaming error: {e_stream}")
-                        yield f"\n[Error: {str(e_stream)}]\n"
+                        yield "I apologize, but I couldn't process your request successfully. Please try again later."
                     finally:
                         await asyncio.to_thread(user_memory.add_user_message, query)
                         await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
@@ -915,11 +1057,52 @@ class EnhancedRAG:
                 await asyncio.to_thread(user_memory.add_ai_message, response_content)
                 return response_content
         
+        # Fallback to GPT-4o when model not recognized
         else:
-            # Fallback to OpenAI if model not supported or client not available
-            print(f"Model {current_llm_model} not supported or client not available. Falling back to OpenAI gpt-4o.")
-            current_llm_model = "gpt-4o"
-            # Continue with OpenAI implementation
+            print(f"Model {current_llm_model} not recognized. Falling back to gpt-4o.")
+            fallback_model = "gpt-4o"
+            
+            # If streaming is requested, we must return a generator
+            if stream:
+                async def fallback_stream_generator():
+                    full_response_content = ""
+                    try:
+                        completion = await self.async_openai_client.chat.completions.create(
+                            model=fallback_model, 
+                            messages=messages, 
+                            temperature=self.default_temperature,
+                            stream=True  # Important: use streaming for streaming requests
+                        )
+                        
+                        async for chunk in completion:
+                            content_piece = chunk.choices[0].delta.content
+                            if content_piece:
+                                full_response_content += content_piece
+                                yield content_piece
+                    except Exception as e_stream:
+                        print(f"Fallback model streaming error: {e_stream}")
+                        yield f"I apologize, but I couldn't process your request successfully. Please try asking in a different way."
+                    finally:
+                        await asyncio.to_thread(user_memory.add_user_message, query)
+                        await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
+                return fallback_stream_generator()
+            else:
+                # Non-streaming fallback implementation
+                try:
+                    completion = await self.async_openai_client.chat.completions.create(
+                        model=fallback_model, 
+                        messages=messages, 
+                        temperature=self.default_temperature,
+                        stream=False
+                    )
+                    response_content = completion.choices[0].message.content or ""
+                except Exception as e_fallback:
+                    print(f"Fallback model error: {e_fallback}")
+                    response_content = "I apologize, but I couldn't process your request with the requested model. Please try again with a different model."
+                
+                await asyncio.to_thread(user_memory.add_user_message, query)
+                await asyncio.to_thread(user_memory.add_ai_message, response_content)
+                return response_content
 
     async def _get_formatted_chat_history(self, session_id: str) -> List[Dict[str,str]]:
         user_memory = await self._get_user_memory(session_id)

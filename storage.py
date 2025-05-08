@@ -87,7 +87,15 @@ class CloudflareR2Storage:
         """
         Upload a file. User documents (is_user_doc=True) go only to R2.
         Knowledge base files (is_user_doc=False) go to R2 with local fallback.
+        Now supports image files as well.
         """
+        # Get file extension
+        _, ext = os.path.splitext(filename)
+        ext = ext.lower()
+        
+        # Check if it's an image file
+        is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+        
         if is_user_doc:
             folder = "user_docs"
             key = f"{folder}/{filename}"
