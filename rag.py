@@ -103,7 +103,6 @@ class EnhancedRAG:
         tavily_api_key: Optional[str] = None,
         default_system_prompt: Optional[str] = None,
         default_temperature: float = 0.2,
-        max_tokens_llm: int = 4000,
         default_use_hybrid_search: bool = False,
     ):
         self.gpt_id = gpt_id
@@ -125,7 +124,7 @@ class EnhancedRAG:
             "Ensure your response is as lengthy and detailed as necessary to fully answer the query, up to the allowed token limit."
         )
         self.default_temperature = default_temperature
-        self.max_tokens_llm = max_tokens_llm
+        self.max_tokens_llm = 32000  # Maximum for most models, will be overridden by API limits
         self.default_use_hybrid_search = default_use_hybrid_search
 
         self.temp_processing_path = temp_processing_path
@@ -213,16 +212,6 @@ class EnhancedRAG:
         if GROQ_AVAILABLE and self.groq_api_key:
             self.groq_client = AsyncGroq(api_key=self.groq_api_key)
             print(f"✅ Groq client initialized successfully")
-        
-        # Model context length mapping
-        self.model_context_limits = {
-            "gpt-4": 8192,
-            "gpt-4o": 128000,
-            "gpt-3.5": 16384,
-            "claude": 100000,
-            "gemini": 32768,
-            "llama": 128000  # Using Groq's llama-70b context window
-        }
     
     def _get_user_qdrant_collection_name(self, session_id: str) -> str:
         safe_session_id = "".join(c if c.isalnum() else '_' for c in session_id)
@@ -467,10 +456,13 @@ class EnhancedRAG:
     def _format_docs_for_llm_context(self, documents: List[Document], source_name: str) -> str:
         if not documents: return ""
         
-        # Enhanced formatting with clear section headers
-        formatted_sections = []
+        # Sort by importance and limit the number of documents before formatting
+        # This is a more aggressive approach to prevent context length issues
+        max_docs = 5  # Hard limit on documents to include
+        documents = documents[:max_docs]
         
-        # Sort documents to prioritize web search results for fresher information
+        # Format the documents as before
+        formatted_sections = []
         web_docs = []
         other_docs = []
         
@@ -569,8 +561,8 @@ class EnhancedRAG:
         base_model_type = None
         if current_llm_model.startswith("gpt-4"):
             base_model_type = "gpt-4"
-        elif current_llm_model.startswith("gpt-3.5"):
-            base_model_type = "gpt-3.5"
+        elif current_llm_model.startswith("gpt-4o-mini"):
+            base_model_type = "gpt-4o-mini"
         elif current_llm_model.startswith("claude"):
             base_model_type = "claude"
         elif current_llm_model.startswith("gemini"):
@@ -580,99 +572,11 @@ class EnhancedRAG:
         else:
             base_model_type = "gpt-4"  # Default fallback
         
-        # Get model context limit
-        max_model_tokens = self.model_context_limits.get(base_model_type, 8192)
-        
         # More aggressive token management for smaller context windows - special handling for web search
         has_web_results = any("web_search" in doc.metadata.get("source_type", "") for doc in all_context_docs)
         
-        if base_model_type == "gpt-4" and max_model_tokens <= 8192:
-            # For original GPT-4, be extremely conservative
-            if has_web_results:
-                # With web search, reserve even more space
-                adjusted_max_tokens = min(self.max_tokens_llm, int(max_model_tokens * 0.15))  # Only 15% for output
-                max_context_tokens = max_model_tokens - adjusted_max_tokens - 1500  # Even larger buffer
-            else:
-                # More conservative for regular queries too
-                adjusted_max_tokens = min(self.max_tokens_llm, int(max_model_tokens * 0.20))  # Only 20% for output
-                max_context_tokens = max_model_tokens - adjusted_max_tokens - 1200
-        else:
-            # For models with larger context windows
-            adjusted_max_tokens = min(self.max_tokens_llm, int(max_model_tokens * 0.33))
-            max_context_tokens = max_model_tokens - adjusted_max_tokens - 500
-        
-        print(f"Model: {current_llm_model}, Context limit: {max_model_tokens}, Max output: {adjusted_max_tokens}")
-        print(f"Web search present: {has_web_results}, Using more conservative limits: {has_web_results}")
-        
-        # Estimate token count and limit documents if needed
-        estimated_prompt_tokens = len(current_system_prompt.split()) * 1.3  # Rough estimate
-        estimated_history_tokens = sum(len(msg["content"].split()) for msg in chat_history_messages) * 1.3
-        
-        # Process and limit documents to avoid context overflow
-        formatted_docs = []
-        total_est_tokens = estimated_prompt_tokens + estimated_history_tokens + 500  # Buffer for query and formatting
-        
-        print(f"Estimated token count before docs: {total_est_tokens}")
-        
-        # Prioritize web search results (they're often more relevant)
-        web_docs = []
-        kb_docs = []
-        user_docs = []
-        
-        # Sort documents by type for prioritization
-        for doc in all_context_docs:
-            source_type = doc.metadata.get("source_type", "")
-            source = str(doc.metadata.get("source", "")).lower()
-            
-            if "web_search" in source_type or "web search" in source:
-                web_docs.append(doc)
-            elif "user" in source:
-                user_docs.append(doc)
-            else:
-                kb_docs.append(doc)
-        
-        # Apply a more aggressive token estimate for web content (tends to be longer)
-        web_multiplier = 1.5  # Web content often has more formatting, links, etc.
-        
-        # Add documents in priority order with stricter limits for web search
-        # Add web search results first (most directly relevant to query)
-        for doc in web_docs:
-            doc_tokens = len(doc.page_content.split()) * web_multiplier
-            if total_est_tokens + doc_tokens > max_context_tokens:
-                print(f"⚠️ Token limit would be exceeded. Limiting context to {len(formatted_docs)} documents.")
-                break
-            
-            formatted_docs.append(doc)
-            total_est_tokens += doc_tokens
-        
-        # Add user docs next (usually more specific than KB)
-        for doc in user_docs:
-            doc_tokens = len(doc.page_content.split()) * 1.3
-            if total_est_tokens + doc_tokens > max_context_tokens:
-                print(f"⚠️ Token limit would be exceeded. Limiting context to {len(formatted_docs)} documents.")
-                break
-            
-            formatted_docs.append(doc)
-            total_est_tokens += doc_tokens
-        
-        # Add KB docs last
-        for doc in kb_docs:
-            doc_tokens = len(doc.page_content.split()) * 1.3
-            if total_est_tokens + doc_tokens > max_context_tokens:
-                print(f"⚠️ Token limit would be exceeded. Limiting context to {len(formatted_docs)} documents.")
-                break
-            
-            formatted_docs.append(doc)
-            total_est_tokens += doc_tokens
-        
-        print(f"Using {len(formatted_docs)} documents out of {len(all_context_docs)} available (est. tokens: {total_est_tokens})")
-        print(f"Adjusted max output tokens: {adjusted_max_tokens} (from original: {self.max_tokens_llm})")
-        
-        # Use adjusted_max_tokens instead of self.max_tokens_llm
-        current_max_tokens = adjusted_max_tokens
-
         # Continue with your existing code using formatted_docs instead of all_context_docs
-        context_str = self._format_docs_for_llm_context(formatted_docs, "Retrieved Context")
+        context_str = self._format_docs_for_llm_context(all_context_docs, "Retrieved Context")
         if not context_str.strip():
             context_str = "No relevant context could be found from any available source for this query. Please ensure documents are uploaded and relevant to your question."
 
@@ -705,10 +609,9 @@ class EnhancedRAG:
                     full_response_content = ""
                     print("Stream generator started")
                     try:
-                        print(f"Starting OpenAI stream with model: {current_llm_model}, max_tokens: {current_max_tokens}")
+                        print(f"Starting OpenAI stream with model: {current_llm_model}")
                         response_stream = await self.async_openai_client.chat.completions.create(
                             model=current_llm_model, messages=messages, temperature=self.default_temperature,
-                            max_tokens=current_max_tokens, 
                             stream=True
                         )
                         print("OpenAI stream created successfully")
@@ -722,51 +625,8 @@ class EnhancedRAG:
                         
                         print(f"Stream complete, total response length: {len(full_response_content)}")
                     except Exception as e_stream:
-                        if "context_length_exceeded" in str(e_stream) or "maximum context length" in str(e_stream):
-                            print(f"Context length exceeded, retrying with reduced context...")
-                            # Cut the context in half
-                            context_str_reduced = context_str[:len(context_str)//2] + "\n... [Content truncated to fit token limits] ...\n"
-                            user_query_message_reduced = (
-                                f"📚 **CONTEXT (truncated):**\n{context_str_reduced}\n\n"
-                                f"Based on the above context and any relevant chat history, provide a detailed, well-structured response to this query:\n\n"
-                                f"**QUERY:** {query}\n\n"
-                                f"Requirements for your response:\n"
-                                f"1. 🎯 Start with a relevant emoji and descriptive headline\n"
-                                f"2. 📋 Organize with clear headings and subheadings\n"
-                                f"3. 📊 Include bullet points or numbered lists where appropriate\n"
-                                f"4. 💡 Highlight key insights or important information\n"
-                                f"Note: Some context was truncated due to length limits. Please respond based on available information."
-                            )
-                            
-                            reduced_messages = [{"role": "system", "content": current_system_prompt}]
-                            reduced_messages.extend(chat_history_messages)
-                            reduced_messages.append({"role": "user", "content": user_query_message_reduced})
-                            
-                            try:
-                                # Retry with reduced context and max tokens
-                                reduced_max_tokens = int(current_max_tokens * 0.8)
-                                yield "\n[Context length exceeded. Retrying with reduced context...]\n\n"
-                                
-                                retry_stream = await self.async_openai_client.chat.completions.create(
-                                    model=current_llm_model, 
-                                    messages=reduced_messages, 
-                                    temperature=self.default_temperature,
-                                    max_tokens=reduced_max_tokens,
-                                    stream=True
-                                )
-                                
-                                async for chunk in retry_stream:
-                                    content_piece = chunk.choices[0].delta.content
-                                    if content_piece:
-                                        full_response_content += content_piece
-                                        yield content_piece
-                                    
-                            except Exception as retry_error:
-                                print(f"Error in retry attempt: {retry_error}")
-                                yield f"\n[Error: {str(e_stream)}]\n[Retry failed: {str(retry_error)}]\n"
-                        else:
-                            print(f"LLM streaming error: {e_stream}")
-                            yield f"\n[Error: {str(e_stream)}]\n"
+                        print(f"LLM streaming error: {e_stream}")
+                        yield f"\n[Error: {str(e_stream)}]\n"
                     finally:
                         print(f"Saving response to memory, length: {len(full_response_content)}")
                         await asyncio.to_thread(user_memory.add_user_message, query)
@@ -777,7 +637,6 @@ class EnhancedRAG:
                 try:
                     completion = await self.async_openai_client.chat.completions.create(
                         model=current_llm_model, messages=messages, temperature=self.default_temperature,
-                        max_tokens=current_max_tokens, # Ensure max_tokens is used here as well
                         stream=False
                     )
                     response_content = completion.choices[0].message.content or ""
@@ -810,7 +669,6 @@ class EnhancedRAG:
                         # Claude streaming call with system as a separate parameter
                         response_stream = await self.anthropic_client.messages.create(
                             model="claude-3-opus-20240229" if "claude" == current_llm_model else current_llm_model,
-                            max_tokens=current_max_tokens,
                             system=system_content,  # System as a separate parameter
                             messages=claude_messages,  # Without system message in the array
                             stream=True
@@ -848,7 +706,6 @@ class EnhancedRAG:
                     # Claude API call with system as a separate parameter
                     response = await self.anthropic_client.messages.create(
                         model="claude-3-opus-20240229" if "claude" == current_llm_model else current_llm_model,
-                        max_tokens=current_max_tokens,
                         system=system_content,  # System as a separate parameter
                         messages=claude_messages  # Without system message in the array
                     )
@@ -892,7 +749,7 @@ class EnhancedRAG:
                         
                         response_stream = await model.generate_content_async(
                             gemini_messages,
-                            generation_config={"temperature": self.default_temperature, "max_output_tokens": current_max_tokens},
+                            generation_config={"temperature": self.default_temperature},
                             stream=True
                         )
                         
@@ -907,14 +764,13 @@ class EnhancedRAG:
                         print(f"Gemini streaming error: {e_stream}")
                         # If we still hit rate limits, fall back to OpenAI
                         if "429" in str(e_stream) or "quota" in str(e_stream).lower():
-                            print("Falling back to OpenAI gpt-gpt-3.5 due to Gemini rate limits")
+                            print("Falling back to OpenAI gpt-4o-mini due to Gemini rate limits")
                             try:
-                                yield "\n[Gemini rate limit reached, switching to GPT-3.5...]\n\n"
+                                yield "\n[Gemini rate limit reached, switching to GPT-4o-mini...]\n\n"
                                 fallback_stream = await self.async_openai_client.chat.completions.create(
-                                    model="gpt-gpt-3.5", 
+                                    model="gpt-4o-mini",
                                     messages=messages, 
                                     temperature=self.default_temperature,
-                                    max_tokens=current_max_tokens, 
                                     stream=True
                                 )
                                 
@@ -956,7 +812,6 @@ class EnhancedRAG:
                             None, 
                             lambda: self.llama_model.create_completion(
                                 prompt=prompt,
-                                max_tokens=current_max_tokens,
                                 temperature=self.default_temperature,
                                 stream=True
                             )
@@ -996,7 +851,6 @@ class EnhancedRAG:
                         None, 
                         lambda: self.llama_model.create_completion(
                             prompt=prompt,
-                            max_tokens=current_max_tokens,
                             temperature=self.default_temperature,
                             stream=False
                         )
@@ -1027,7 +881,6 @@ class EnhancedRAG:
                             model=groq_model,
                             messages=groq_messages,
                             temperature=self.default_temperature,
-                            max_tokens=adjusted_max_tokens,
                             stream=True
                         )
                         
@@ -1056,7 +909,6 @@ class EnhancedRAG:
                         model=groq_model,
                         messages=groq_messages,
                         temperature=self.default_temperature,
-                        max_tokens=current_max_tokens,
                         stream=False
                     )
                     
