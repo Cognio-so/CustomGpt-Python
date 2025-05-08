@@ -456,10 +456,11 @@ class EnhancedRAG:
     def _format_docs_for_llm_context(self, documents: List[Document], source_name: str) -> str:
         if not documents: return ""
         
-        # Sort by importance and limit the number of documents before formatting
-        # This is a more aggressive approach to prevent context length issues
-        max_docs = 5  # Hard limit on documents to include
-        documents = documents[:max_docs]
+        # No document limiting - use all documents
+        # Removed: max_docs = 2 and documents[:max_docs]
+        
+        # No content truncation
+        # Removed: truncation of document content
         
         # Format the documents as before
         formatted_sections = []
@@ -473,6 +474,7 @@ class EnhancedRAG:
             else:
                 other_docs.append(doc)
         
+        # Process all documents without limits
         # Process web search documents first
         if web_docs:
             formatted_sections.append("## 🌐 WEB SEARCH RESULTS")
@@ -557,25 +559,13 @@ class EnhancedRAG:
         current_llm_model = llm_model_name_override or self.default_llm_model_name
         current_system_prompt = system_prompt_override or self.default_system_prompt
         
-        # Get the base model type and context limit
-        base_model_type = None
-        if current_llm_model.startswith("gpt-4"):
-            base_model_type = "gpt-4"
-        elif current_llm_model.startswith("gpt-4o-mini"):
-            base_model_type = "gpt-4o-mini"
-        elif current_llm_model.startswith("claude"):
-            base_model_type = "claude"
-        elif current_llm_model.startswith("gemini"):
-            base_model_type = "gemini"
-        elif current_llm_model.startswith("llama"):
-            base_model_type = "llama"
-        else:
-            base_model_type = "gpt-4"  # Default fallback
+        # Remove all base_model_type detection and context limit logic
+        # Deleted: base_model_type detection, token calculation, etc.
         
-        # More aggressive token management for smaller context windows - special handling for web search
-        has_web_results = any("web_search" in doc.metadata.get("source_type", "") for doc in all_context_docs)
+        # Remove web search detection for context limits
+        # Deleted: has_web_results detection
         
-        # Continue with your existing code using formatted_docs instead of all_context_docs
+        # Continue with simplified code...
         context_str = self._format_docs_for_llm_context(all_context_docs, "Retrieved Context")
         if not context_str.strip():
             context_str = "No relevant context could be found from any available source for this query. Please ensure documents are uploaded and relevant to your question."
@@ -610,11 +600,13 @@ class EnhancedRAG:
                     print("Stream generator started")
                     try:
                         print(f"Starting OpenAI stream with model: {current_llm_model}")
+                        # Always use full context, no model-specific handling
                         response_stream = await self.async_openai_client.chat.completions.create(
-                            model=current_llm_model, messages=messages, temperature=self.default_temperature,
+                            model=current_llm_model, 
+                            messages=messages, 
+                            temperature=self.default_temperature,
                             stream=True
                         )
-                        print("OpenAI stream created successfully")
                         
                         async for chunk in response_stream:
                             content_piece = chunk.choices[0].delta.content
@@ -625,8 +617,10 @@ class EnhancedRAG:
                         
                         print(f"Stream complete, total response length: {len(full_response_content)}")
                     except Exception as e_stream:
-                        print(f"LLM streaming error: {e_stream}")
-                        yield f"\n[Error: {str(e_stream)}]\n"
+                        # Pass errors straight through
+                        print(f"Error during streaming: {e_stream}")
+                        # Don't show error to user
+                        yield f"I apologize, but I couldn't process your request successfully. Please try asking in a different way."
                     finally:
                         print(f"Saving response to memory, length: {len(full_response_content)}")
                         await asyncio.to_thread(user_memory.add_user_message, query)
@@ -682,7 +676,7 @@ class EnhancedRAG:
                                 
                     except Exception as e_stream:
                         print(f"Claude streaming error: {e_stream}")
-                        yield f"\n[Error: {str(e_stream)}]\n"
+                        yield "I apologize, but I couldn't process your request successfully. Please try again later."
                     finally:
                         await asyncio.to_thread(user_memory.add_user_message, query)
                         await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
@@ -764,9 +758,9 @@ class EnhancedRAG:
                         print(f"Gemini streaming error: {e_stream}")
                         # If we still hit rate limits, fall back to OpenAI
                         if "429" in str(e_stream) or "quota" in str(e_stream).lower():
-                            print("Falling back to OpenAI gpt-4o-mini due to Gemini rate limits")
+                            print("Gemini encountered an issue, switching to OpenAI")
                             try:
-                                yield "\n[Gemini rate limit reached, switching to GPT-4o-mini...]\n\n"
+                                yield "\nSwitching to alternative AI model...\n\n"
                                 fallback_stream = await self.async_openai_client.chat.completions.create(
                                     model="gpt-4o-mini",
                                     messages=messages, 
@@ -780,7 +774,7 @@ class EnhancedRAG:
                                         full_response_content += content_piece
                                         yield content_piece
                             except Exception as fallback_error:
-                                yield f"\n[Error in fallback model: {str(fallback_error)}]\n"
+                                yield "I apologize, but I couldn't process your request. Please try again later."
                         else:
                             yield f"\n[Error: {str(e_stream)}]\n"
                     finally:
