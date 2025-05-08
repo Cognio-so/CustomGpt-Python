@@ -23,7 +23,7 @@ app = FastAPI(title="Enhanced RAG API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://agt-tester-frontend.vercel.app", "http://localhost:5173"],
+    allow_origins=["https://www.mygpt.work", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
