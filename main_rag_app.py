@@ -483,21 +483,3 @@ async def dev_reset_gpt_context_endpoint(gpt_id: str = Form(...)):
                 return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
         else:
             return JSONResponse(status_code=404, content={"status": "not_found", "message": f"No active RAG context for gpt_id '{gpt_id}'."})
-
-if __name__ == "__main__":
-    print("Starting RAG API server...")
-    print(f"Local data base path: {os.path.abspath(LOCAL_DATA_BASE_PATH)}")
-    print(f"OpenAI API Key Loaded: {'Yes' if os.getenv('OPENAI_API_KEY') else 'No - Set OPENAI_API_KEY'}")
-    print(f"CORS Origins: {os.getenv('CORS_ALLOWED_ORIGINS', '["http://localhost:5173", "https://agt-tester-frontend.vercel.app"]')}")
-    
-    uvicorn.run(
-        "main_rag_app:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", 8000)),
-        reload=os.getenv("ENVIRONMENT_TYPE", "").lower() == "development",
-        timeout_keep_alive=60
-    )
-
-# Note: To fix the LangChainDeprecationWarning in rag.py, update the import as follows:
-# from langchain_community.chat_message_histories import ChatMessageHistory
-# This should be applied in the rag.py file to avoid the deprecation warning.
