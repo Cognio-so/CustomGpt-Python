@@ -83,11 +83,13 @@ class CloudflareR2Storage:
             print(f"Error saving KB file '{filename}' locally: {e}")
             return False, str(e)
 
-    def upload_file(self, file_data, filename: str, is_user_doc: bool = False) -> Tuple[bool, str]:
+    def upload_file(self, file_data, filename: str, is_user_doc: bool = False, 
+                    schedule_deletion_hours: int = 72) -> Tuple[bool, str]:
         """
         Upload a file. User documents (is_user_doc=True) go only to R2.
         Knowledge base files (is_user_doc=False) go to R2 with local fallback.
         Now supports image files as well.
+        Automatically schedules deletion after specified hours (default: 72).
         """
         # Get file extension
         _, ext = os.path.splitext(filename)
@@ -112,7 +114,11 @@ class CloudflareR2Storage:
 
                 self.r2.meta.client.upload_fileobj(file_obj_to_upload, self.bucket_name, key)
                 file_url = f"https://{self.bucket_name}.{self.account_id}.r2.cloudflarestorage.com/{key}"
-                print(f"User document '{filename}' uploaded successfully to R2: {file_url}")
+                
+                # Schedule deletion after specified hours
+                self.schedule_deletion(key, schedule_deletion_hours)
+                
+                print(f"User document '{filename}' uploaded successfully to R2: {file_url} (will be deleted after {schedule_deletion_hours} hours)")
                 return True, file_url
             except Exception as e:
                 print(f"Error uploading user document '{filename}' to R2: {e}. Will not fall back to local storage.")
@@ -133,7 +139,11 @@ class CloudflareR2Storage:
 
                 self.r2.meta.client.upload_fileobj(file_obj_to_upload, self.bucket_name, key)
                 file_url = f"https://{self.bucket_name}.{self.account_id}.r2.cloudflarestorage.com/{key}"
-                print(f"KB file '{filename}' uploaded successfully to R2: {file_url}")
+                
+                # Schedule deletion after specified hours
+                self.schedule_deletion(key, schedule_deletion_hours)
+                
+                print(f"KB file '{filename}' uploaded successfully to R2: {file_url} (will be deleted after {schedule_deletion_hours} hours)")
                 return True, file_url
             except Exception as e:
                 print(f"Error uploading KB file '{filename}' to R2: {e}. Falling back to local storage.")
@@ -319,3 +329,112 @@ class CloudflareR2Storage:
         except Exception as e:
             print(f"Error listing files from R2 with prefix '{prefix}': {e}")
             return []
+
+    def schedule_deletion(self, key: str, hours: int = 72) -> bool:
+        """
+        Schedule a file for deletion after specified hours (default: 72 hours)
+        This works by setting object metadata with expiration time
+        """
+        if self.use_local_fallback or not self.r2:
+            print(f"R2 unavailable/uninitialized. Cannot schedule deletion for '{key}'.")
+            return False
+        
+        try:
+            # First, check if object exists
+            try:
+                self.r2.meta.client.head_object(Bucket=self.bucket_name, Key=key)
+            except ClientError as e:
+                if e.response['Error']['Code'] == '404':
+                    print(f"File '{key}' not found in R2, cannot schedule deletion.")
+                    return False
+                raise
+            
+            # Set object lifecycle metadata
+            import datetime
+            
+            # Calculate expiration time
+            expiration_time = datetime.datetime.now() + datetime.timedelta(hours=hours)
+            expiration_timestamp = int(expiration_time.timestamp())
+            
+            # Copy object to itself with new metadata (can't update metadata directly)
+            self.r2.meta.client.copy_object(
+                Bucket=self.bucket_name,
+                CopySource={'Bucket': self.bucket_name, 'Key': key},
+                Key=key,
+                Metadata={
+                    'expiration_time': str(expiration_timestamp),
+                    'auto_delete': 'true'
+                },
+                MetadataDirective='REPLACE'
+            )
+            
+            print(f"File '{key}' scheduled for deletion after {hours} hours (at {expiration_time}).")
+            return True
+        except Exception as e:
+            print(f"Error scheduling deletion for '{key}': {e}")
+            return False
+
+    def check_and_delete_expired_files(self) -> int:
+        """
+        Check all files and delete those that have passed their expiration time
+        Returns count of deleted files
+        """
+        if self.use_local_fallback or not self.r2:
+            print("R2 unavailable/uninitialized. Cannot check for expired files.")
+            return 0
+        
+        import datetime
+        deleted_count = 0
+        current_time = datetime.datetime.now().timestamp()
+        
+        try:
+            # List all objects in the bucket
+            paginator = self.r2.meta.client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.bucket_name)
+            
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+                    
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    
+                    try:
+                        # Get object metadata
+                        response = self.r2.meta.client.head_object(
+                            Bucket=self.bucket_name,
+                            Key=key
+                        )
+                        
+                        metadata = response.get('Metadata', {})
+                        if 'expiration_time' in metadata and metadata.get('auto_delete') == 'true':
+                            expiration_time = int(metadata['expiration_time'])
+                            
+                            # Check if file has expired
+                            if current_time > expiration_time:
+                                # Delete the expired file
+                                self.r2.meta.client.delete_object(
+                                    Bucket=self.bucket_name,
+                                    Key=key
+                                )
+                                print(f"Deleted expired file '{key}'")
+                                deleted_count += 1
+                    except Exception as e_obj:
+                        print(f"Error checking metadata for '{key}': {e_obj}")
+            
+            return deleted_count
+        except Exception as e:
+            print(f"Error checking for expired files: {e}")
+            return 0
+
+    def cleanup_expired_files(self):
+        """Run periodic cleanup of expired files"""
+        if self.use_local_fallback or not self.r2:
+            return
+        
+        try:
+            deleted_count = self.check_and_delete_expired_files()
+            if deleted_count > 0:
+                print(f"Cleanup completed: deleted {deleted_count} expired files")
+        except Exception as e:
+            print(f"Error during cleanup of expired files: {e}")

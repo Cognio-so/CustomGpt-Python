@@ -95,7 +95,7 @@ except ImportError:
 
 load_dotenv()
 
-# Vector params for OpenAI's text-embedding-ada-002
+# Vector params for OpenAI's text-embedding-3-small
 QDRANT_VECTOR_PARAMS = qdrant_models.VectorParams(size=1536, distance=qdrant_models.Distance.COSINE)
 CONTENT_PAYLOAD_KEY = "page_content"
 METADATA_PAYLOAD_KEY = "metadata"
@@ -143,7 +143,10 @@ class EnhancedRAG:
         self.temp_processing_path = temp_processing_path
         os.makedirs(self.temp_processing_path, exist_ok=True)
 
-        self.embeddings_model = OpenAIEmbeddings(api_key=self.openai_api_key)
+        self.embeddings_model = OpenAIEmbeddings(
+            api_key=self.openai_api_key,
+            model="text-embedding-3-small"  # Explicitly set the model name
+        )
         
         # Configure AsyncOpenAI client with custom timeouts
         # Default httpx timeouts are often too short (5s for read/write/connect)
@@ -230,13 +233,23 @@ class EnhancedRAG:
         self.has_vision_capability = default_llm_model_name in [
             "gpt-4o", 
             "gpt-4o-mini", 
+            "gpt-4-vision",
             "gemini-flash-2.5", 
             "gemini-pro-2.5",
-            "claude-3.5-haiku"
+            "gemini-1.5-pro",  # Add Gemini 1.5 Pro
+            "claude-3-5-sonnet",  # Add Claude 3.5 Sonnet
+            "claude-3-5-haiku",
+            "claude-3-haiku",
+            "claude-3-sonnet",
+            "claude-3-opus",
+            "llama-3-70b-vision",
+            "llama-3-8b-vision",
+            "llama-4-scout"  # Add Llama 4 Scout
         ]
         
         # Track if this model is a Gemini model (for vision processing)
-        self.is_gemini_model = default_llm_model_name in ["gemini-flash-2.5", "gemini-pro-2.5"]
+        normalized_model_name = default_llm_model_name.lower().replace("-", "").replace("_", "")
+        self.is_gemini_model = "gemini" in normalized_model_name
         
         if self.has_vision_capability:
             if self.is_gemini_model:
@@ -372,10 +385,10 @@ class EnhancedRAG:
                             )
                             loaded_docs = [doc]
                     except Exception as e_img:
-                        print(f"All image processing methods failed: {e_img}")
+                        print(f"Image processing failed: {e_img}")
                         # Create a fallback document
                         doc = Document(
-                            page_content="[This is an image file that could not be automatically analyzed. Please ask specific questions about what you're looking for in this image.]",
+                            page_content="[This is an image file that could not be processed. Error: " + str(e_img) + "]",
                             metadata={"source": r2_key_or_url, "file_type": "image", "processing_error": str(e_img)}
                         )
                         loaded_docs = [doc]
@@ -418,62 +431,143 @@ class EnhancedRAG:
             # Convert image to base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
-            if self.is_gemini_model and GEMINI_AVAILABLE and self.gemini_client:
-                print(f"Using {self.default_llm_model_name} for image processing")
+            # Original model name selected by the user
+            user_selected_model_name_lower = self.default_llm_model_name.lower()
+            
+            # 1. Gemini models
+            if "gemini" in user_selected_model_name_lower and GEMINI_AVAILABLE and self.gemini_client:
+                print(f"Using {self.default_llm_model_name} for image processing via Gemini")
+                gemini_api_name = "gemini-1.5-pro" # Default vision model for Gemini
                 try:
-                    # Map Gemini model names
-                    gemini_model_name = "gemini-pro-vision"  # Default fallback for vision
-                    if self.default_llm_model_name == "gemini-flash-2.5":
-                        gemini_model_name = "gemini-2.5-flash-preview-04-17"
-                    elif self.default_llm_model_name == "gemini-pro-2.5":
-                        gemini_model_name = "gemini-2.5-pro-preview-05-06"
-                    
-                    # Process with Gemini Vision
+                    if "flash" in user_selected_model_name_lower:
+                        gemini_api_name = "gemini-1.5-flash"
+                    # (No other specific Gemini model name checks needed, defaults to 1.5-pro for vision)
+
                     image_parts = [{"mime_type": "image/jpeg", "data": base64_image}]
                     prompt_text = "Describe the content of this image in detail, including any visible text."
                     
-                    model = self.gemini_client.GenerativeModel(gemini_model_name)
-                    response = await model.generate_content_async(contents=[prompt_text] + image_parts)
+                    api_model_to_call = self.gemini_client.GenerativeModel(gemini_api_name)
+                    response = await api_model_to_call.generate_content_async(contents=[prompt_text] + image_parts)
                     
-                    if hasattr(response, "text"):
-                        return f"Image Content ({self.default_llm_model_name} Analysis):\n{response.text}"
+                    if hasattr(response, "text") and response.text:
+                        return f"Image Content ({gemini_api_name} Analysis):\n{response.text}"
+                    else:
+                        error_message_from_response = "No text content in response"
+                        if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                            error_message_from_response = f"Blocked: {getattr(response.prompt_feedback, 'block_reason_message', '') or response.prompt_feedback.block_reason}"
+                        elif hasattr(response, 'candidates') and response.candidates and response.candidates[0].finish_reason != 'STOP':
+                            error_message_from_response = f"Finished with reason: {response.candidates[0].finish_reason}"
+                        raise Exception(f"Gemini Vision ({gemini_api_name}) processing issue: {error_message_from_response}")
+
                 except Exception as e_gemini:
-                    print(f"Error with Gemini Vision: {e_gemini}")
+                    resolved_gemini_api_name = gemini_api_name if 'gemini_api_name' in locals() else 'N/A'
+                    print(f"Error with Gemini Vision (input: {self.default_llm_model_name} -> attempted: {resolved_gemini_api_name}): {e_gemini}")
+                    raise Exception(f"Gemini Vision processing failed: {e_gemini}")
             
-            # Use OpenAI or Claude if not using Gemini
-            if self.default_llm_model_name.startswith("gpt-"):
-                model = self.default_llm_model_name  # Use the actual configured model
-                response = await self.async_openai_client.chat.completions.create(
-                    model=model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]
-                    }],
-                    max_tokens=4000
-                )
-                return f"Image Content ({model} Analysis):\n{response.choices[0].message.content}"
+            # 2. OpenAI models (GPT-4o, GPT-4o-mini, GPT-4-vision)
+            elif "gpt-" in user_selected_model_name_lower:
+                openai_model_to_call = self.default_llm_model_name # Default to user selected
+                if user_selected_model_name_lower == "gpt-4o-mini":
+                    openai_model_to_call = "gpt-4o" # Use gpt-4o for gpt-4o-mini's vision tasks
+                    print(f"Using gpt-4o for image processing (selected: {self.default_llm_model_name})")
+                else:
+                    print(f"Using {self.default_llm_model_name} for image processing")
+                
+                try:
+                    response = await self.async_openai_client.chat.completions.create(
+                        model=openai_model_to_call,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            ]
+                        }]
+                    )
+                    return f"Image Content ({openai_model_to_call} Analysis):\n{response.choices[0].message.content}"
+                except Exception as e_openai:
+                    print(f"Error with OpenAI Vision ({openai_model_to_call}): {e_openai}")
+                    raise Exception(f"OpenAI Vision processing failed: {e_openai}")
             
-            elif self.default_llm_model_name.startswith("claude") and CLAUDE_AVAILABLE:
-                model = "claude-3.5-haiku-20240307"  # Use exact model ID with version
-                response = await self.anthropic_client.messages.create(
-                    model=model,
-                    messages=[{
-                        "role": "user", 
-                        "content": [
-                            {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image}}
-                        ]
-                    }],
-                    max_tokens=4000
-                )
-                return f"Image Content ({model} Analysis):\n{response.content[0].text}"
+            # 3. Claude models
+            elif "claude" in user_selected_model_name_lower and CLAUDE_AVAILABLE and self.anthropic_client:
+                print(f"Using {self.default_llm_model_name} for image processing")
+                try:
+                    claude_model_to_call = "claude-3-5-sonnet-20240620" # Default to Claude 3.5 Sonnet
+                    if "opus" in user_selected_model_name_lower:
+                        claude_model_to_call = "claude-3-opus-20240229"
+                    # No need to check for "3-5" in sonnet/haiku explicitly, direct model names are better
+                    elif "claude-3-sonnet" in user_selected_model_name_lower: # Catches "claude-3-sonnet-20240229"
+                         claude_model_to_call = "claude-3-sonnet-20240229"
+                    elif "claude-3-haiku" in user_selected_model_name_lower: # Catches "claude-3-haiku-20240307"
+                         claude_model_to_call = "claude-3-haiku-20240307"
+                    # Specific checks for 3.5 models to ensure correct IDs
+                    elif "claude-3.5-sonnet" in user_selected_model_name_lower:
+                        claude_model_to_call = "claude-3.5-sonnet-20240620"
+                    elif "claude-3.5-haiku" in user_selected_model_name_lower:
+                         claude_model_to_call = "claude-3.5-haiku-20240307" # Assuming this is the correct ID from Anthropic docs
+
+                    response = await self.anthropic_client.messages.create(
+                        model=claude_model_to_call,
+                        messages=[{
+                            "role": "user", 
+                            "content": [
+                                {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image}}
+                            ]
+                        }]
+                    )
+                    return f"Image Content ({claude_model_to_call} Analysis):\n{response.content[0].text}"
+                except Exception as e_claude:
+                    print(f"Error with Claude Vision: {e_claude}")
+                    raise Exception(f"Claude Vision processing failed: {e_claude}")
             
-            # Fallback to basic image analysis if model has no vision capabilities
-            raise Exception(f"Model {self.default_llm_model_name} doesn't support vision capabilities")
+            # 4. Llama models (via Groq)
+            elif "llama" in user_selected_model_name_lower and GROQ_AVAILABLE and self.groq_client:
+                print(f"Processing Llama model {self.default_llm_model_name} for image via Groq")
+                try:
+                    groq_model_to_call = None
+                    # More robust matching for Llama 4 Scout and Maverick
+                    if "llama" in user_selected_model_name_lower and "4" in user_selected_model_name_lower and "scout" in user_selected_model_name_lower:
+                        groq_model_to_call = "meta-llama/llama-4-scout-17b-16e-instruct"
+                    elif "llama" in user_selected_model_name_lower and "4" in user_selected_model_name_lower and "maverick" in user_selected_model_name_lower:
+                        groq_model_to_call = "meta-llama/llama-4-maverick-17b-128e-instruct"
+                    elif "llava" in user_selected_model_name_lower: # For models like "llava-v1.5-7b"
+                        groq_model_to_call = "llava-v1.5-7b-4096-preview"
+                    elif "llama3" in user_selected_model_name_lower or "llama-3" in user_selected_model_name_lower:
+                        # Llama 3 models on Groq do not support vision. This is an explicit failure.
+                        raise Exception(f"The selected Llama 3 model ({self.default_llm_model_name}) does not support vision capabilities on Groq. Please choose a Llama 4 or LLaVA model for vision.")
+                    else:
+                        # Fallback for other Llama models not explicitly listed for vision
+                        raise Exception(f"No configured vision-capable Llama model on Groq for '{self.default_llm_model_name}'. Supported for vision are Llama 4 Scout/Maverick and LLaVA.")
+
+                    print(f"Attempting to use Groq vision model: {groq_model_to_call}")
+                    
+                    messages_for_groq = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe the content of this image in detail, including any visible text."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            ]
+                        }
+                    ]
+                    if self.default_system_prompt:
+                        messages_for_groq.insert(0, {"role": "system", "content": "You are an AI assistant that accurately describes images."})
+
+                    response = await self.groq_client.chat.completions.create(
+                        model=groq_model_to_call,
+                        messages=messages_for_groq,
+                        temperature=0.2,
+                        stream=False
+                    )
+                    return f"Image Content ({groq_model_to_call} Analysis via Groq):\n{response.choices[0].message.content}"
+                except Exception as e_llama_groq:
+                    print(f"Error with Llama Vision through Groq (Model: {self.default_llm_model_name}): {e_llama_groq}")
+                    raise Exception(f"Llama Vision processing failed: {e_llama_groq}")
             
+            # If model doesn't match any of the known vision-capable types
+            raise Exception(f"Model {self.default_llm_model_name} doesn't have a configured vision capability handler or required SDKs are not available.")
         except Exception as e:
             print(f"Error using Vision API: {e}")
             # Basic image properties fallback
@@ -482,9 +576,9 @@ class EnhancedRAG:
                 width, height = img.size
                 format_type = img.format
                 mode = img.mode
-                return f"[Image file: {width}x{height} {format_type} in {mode} mode]"
+                return f"[Image file: {width}x{height} {format_type} in {mode} mode. Vision processing failed with error: {str(e)}]"
             except Exception as e_img:
-                return "[Image file detected but couldn't be processed]"
+                return "[Image file detected but couldn't be processed. Vision API error: " + str(e) + "]"
 
     async def _index_documents_to_qdrant_batch(self, docs_to_index: List[Document], collection_name: str):
         if not docs_to_index: return
@@ -993,11 +1087,8 @@ class EnhancedRAG:
         
         # Llama models (Llama 3 and Llama 4 Scout via Groq)
         elif (current_llm_model.startswith("llama") or current_llm_model.startswith("meta-llama/")) and GROQ_AVAILABLE and self.groq_client:
-            # Map to the specific Llama model with more robust name matching
-            groq_model = "llama3-8b-8192"  # Default for Llama 3
-            
-            # Handle different variations of Llama 4 Scout name
-            if "llama 4" in current_llm_model.lower() or "llama-4" in current_llm_model.lower() or current_llm_model.startswith("meta-llama/llama-4"):
+            # Map to the correct Llama model with vision capabilities
+            if "4" in current_llm_model.lower() or "llama-4" in current_llm_model.lower() or current_llm_model.startswith("meta-llama/llama-4"):
                 # Use a model that actually exists in Groq as fallback
                 groq_model = "llama3-70b-8192"  # Higher quality Llama model available on Groq
                 print(f"Using Groq with llama3-70b-8192 model (as fallback for Llama 4 Scout)")

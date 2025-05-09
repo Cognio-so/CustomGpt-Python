@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Body, Request
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Body, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import time
 from io import BytesIO
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
 
 from storage import CloudflareR2Storage
 from rag import EnhancedRAG
@@ -19,7 +21,38 @@ from qdrant_client.http import models as rest
 
 load_dotenv()
 
-app = FastAPI(title="Enhanced RAG API", version="1.0.0")
+# Define the cleanup function first
+async def cleanup_r2_expired_files():
+    """Periodic task to clean up expired R2 files"""
+    print("Running scheduled cleanup of expired R2 files...")
+    try:
+        # Initialize r2_storage first to avoid reference before assignment
+        r2_storage = CloudflareR2Storage()
+        await asyncio.to_thread(r2_storage.cleanup_expired_files)
+    except Exception as e:
+        print(f"Error during scheduled R2 cleanup: {e}")
+
+# Define the lifespan manager before app initialization
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup code
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(cleanup_r2_expired_files, 'interval', hours=6)
+    scheduler.start()
+    print("Scheduler started: R2 cleanup will run every 6 hours")
+    
+    yield  # This is where the app runs
+    
+    # Shutdown code
+    scheduler.shutdown()
+    print("Scheduler shut down")
+
+# Now initialize the app after defining the lifespan function
+app = FastAPI(
+    title="Enhanced RAG API", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +62,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
+# Now initialize r2_storage after app is defined
 r2_storage = CloudflareR2Storage()
 
 active_rag_sessions: Dict[str, EnhancedRAG] = {}
@@ -507,3 +541,14 @@ async def dev_reset_gpt_context_endpoint(gpt_id: str = Form(...)):
                 return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
         else:
             return JSONResponse(status_code=404, content={"status": "not_found", "message": f"No active RAG context for gpt_id '{gpt_id}'."})
+
+@app.post("/maintenance/cleanup-r2", summary="Manually trigger cleanup of expired R2 files", tags=["Maintenance"])
+async def manual_cleanup_r2():
+    try:
+        await asyncio.to_thread(r2_storage.cleanup_expired_files)
+        return {"status": "success", "message": "R2 cleanup completed"}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Error during R2 cleanup: {str(e)}"}
+        )
