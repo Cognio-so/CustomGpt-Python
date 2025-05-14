@@ -117,6 +117,7 @@ class GptOpenedRequest(BaseModel):
     file_urls: List[str] = []
     use_hybrid_search: bool = False
     config_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")  # Renamed to avoid shadowing
+    api_keys: Optional[Dict[str, str]] = Field(default_factory=dict)  # Add API keys field
 
 # --- Helper Functions ---
 def get_session_id(user_email: str, gpt_id: str) -> str:
@@ -129,21 +130,29 @@ async def get_or_create_rag_instance(
     gpt_name: Optional[str] = "default_gpt",
     default_model: Optional[str] = None,
     default_system_prompt: Optional[str] = None,
-    default_use_hybrid_search: Optional[bool] = False
+    default_use_hybrid_search: Optional[bool] = False,
+    api_keys: Optional[Dict[str, str]] = None
 ) -> EnhancedRAG:
     async with sessions_lock:
         if gpt_id not in active_rag_sessions:
             print(f"Creating new EnhancedRAG instance for gpt_id: {gpt_id}")
             
-            openai_api_key = os.getenv("OPENAI_API_KEY")
+            # Use API keys from frontend if available, otherwise fallback to environment
+            openai_api_key = api_keys.get('openai') if api_keys and 'openai' in api_keys else os.getenv("OPENAI_API_KEY")
             if not openai_api_key:
-                raise ValueError("OPENAI_API_KEY not set in environment.")
+                raise ValueError("OPENAI_API_KEY not set in environment or not provided by frontend.")
                 
             qdrant_url = os.getenv("QDRANT_URL")
             qdrant_api_key = os.getenv("QDRANT_API_KEY")
             
             if not qdrant_url:
                 raise ValueError("QDRANT_URL not set in environment.")
+                
+            # Get optional API keys for other providers from frontend or environment
+            tavily_api_key = api_keys.get('tavily') if api_keys and 'tavily' in api_keys else os.getenv("TAVILY_API_KEY")
+            claude_api_key = api_keys.get('claude') if api_keys and 'claude' in api_keys else os.getenv("ANTHROPIC_API_KEY")
+            gemini_api_key = api_keys.get('gemini') if api_keys and 'gemini' in api_keys else os.getenv("GOOGLE_API_KEY")
+            groq_api_key = api_keys.get('groq') if api_keys and 'groq' in api_keys else os.getenv("GROQ_API_KEY")
 
             active_rag_sessions[gpt_id] = EnhancedRAG(
                 gpt_id=gpt_id,
@@ -154,8 +163,36 @@ async def get_or_create_rag_instance(
                 qdrant_api_key=qdrant_api_key,
                 temp_processing_path=TEMP_DOWNLOAD_PATH,
                 default_system_prompt=default_system_prompt,
-                default_use_hybrid_search=default_use_hybrid_search
+                default_use_hybrid_search=default_use_hybrid_search,
+                tavily_api_key=tavily_api_key
             )
+            
+            # Update API keys for other providers if available
+            rag_instance = active_rag_sessions[gpt_id]
+            if claude_api_key and hasattr(rag_instance, "claude_api_key"):
+                rag_instance.claude_api_key = claude_api_key
+                # Reinitialize Anthropic client if possible
+                if hasattr(rag_instance, "anthropic_client") and CLAUDE_AVAILABLE:
+                    import anthropic
+                    rag_instance.anthropic_client = anthropic.AsyncAnthropic(api_key=claude_api_key)
+                    print(f"✅ Claude client reinitialized with user-provided API key")
+                
+            if gemini_api_key and hasattr(rag_instance, "gemini_api_key"):
+                rag_instance.gemini_api_key = gemini_api_key
+                # Reinitialize Gemini client if possible
+                if hasattr(rag_instance, "gemini_client") and GEMINI_AVAILABLE:
+                    import google.generativeai as genai
+                    genai.configure(api_key=gemini_api_key)
+                    rag_instance.gemini_client = genai
+                    print(f"✅ Gemini client reinitialized with user-provided API key")
+                
+            if groq_api_key and hasattr(rag_instance, "groq_api_key"):
+                rag_instance.groq_api_key = groq_api_key
+                # Reinitialize Groq client if possible
+                if hasattr(rag_instance, "groq_client") and GROQ_AVAILABLE:
+                    from groq import AsyncGroq
+                    rag_instance.groq_client = AsyncGroq(api_key=groq_api_key)
+                    print(f"✅ Groq client reinitialized with user-provided API key")
         else:
             rag_instance = active_rag_sessions[gpt_id]
             if default_model:
@@ -164,7 +201,40 @@ async def get_or_create_rag_instance(
                 rag_instance.default_system_prompt = default_system_prompt
             if default_use_hybrid_search is not None:
                 rag_instance.default_use_hybrid_search = default_use_hybrid_search
-            print(f"Reusing EnhancedRAG instance for gpt_id: {gpt_id}. Updated defaults if provided.")
+                
+            # Update API keys if a RAG instance already exists
+            if api_keys:
+                # Update OpenAI API key if provided
+                if 'openai' in api_keys and api_keys['openai']:
+                    old_key = rag_instance.openai_api_key
+                    new_key = api_keys['openai']
+                    if old_key != new_key:
+                        rag_instance.openai_api_key = new_key
+                        # Update OpenAI client with new key
+                        if hasattr(rag_instance, "async_openai_client"):
+                            # Try to reinitialize OpenAI client with new key
+                            try:
+                                import httpx
+                                from openai import AsyncOpenAI
+                                timeout_config = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
+                                rag_instance.async_openai_client = AsyncOpenAI(
+                                    api_key=new_key,
+                                    timeout=timeout_config,
+                                    max_retries=1
+                                )
+                                print(f"✅ OpenAI client reinitialized with user-provided API key")
+                            except Exception as e:
+                                print(f"❌ Error reinitializing OpenAI client: {e}")
+                
+                # Update other API keys similarly if they exist in the instance
+                for key_name in ['claude', 'gemini', 'groq', 'tavily']:
+                    if key_name in api_keys and api_keys[key_name] and hasattr(rag_instance, f"{key_name}_api_key"):
+                        attr_name = f"{key_name}_api_key"
+                        if getattr(rag_instance, attr_name) != api_keys[key_name]:
+                            setattr(rag_instance, attr_name, api_keys[key_name])
+                            print(f"✅ Updated {key_name} API key for RAG instance {gpt_id}")
+                
+            print(f"Reusing EnhancedRAG instance for gpt_id: {gpt_id}. Updated defaults and API keys if provided.")
 
         return active_rag_sessions[gpt_id]
 
@@ -405,7 +475,8 @@ async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: Backg
             gpt_name=request.gpt_name,
             default_model=request.config_schema.get("model") if request.config_schema else None,
             default_system_prompt=request.config_schema.get("instructions") if request.config_schema else None,
-            default_use_hybrid_search=request.config_schema.get("capabilities", {}).get("hybridSearch", False) if request.config_schema else request.use_hybrid_search
+            default_use_hybrid_search=request.config_schema.get("capabilities", {}).get("hybridSearch", False) if request.config_schema else request.use_hybrid_search,
+            api_keys=request.api_keys if hasattr(request, "api_keys") else None  # Pass API keys to the function
         )
         
         sanitized_email = request.user_email.replace('@', '_').replace('.', '_')
@@ -552,3 +623,5 @@ async def manual_cleanup_r2():
             status_code=500,
             content={"status": "error", "message": f"Error during R2 cleanup: {str(e)}"}
         )
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
