@@ -93,6 +93,14 @@ except ImportError:
     GROQ_AVAILABLE = False
     print("Groq Python SDK not found. Llama models will use Groq as fallback.")
 
+# OpenRouter (Optional)
+try:
+    # OpenRouter uses the same API format as OpenAI
+    OPENROUTER_AVAILABLE = True
+except ImportError:
+    OPENROUTER_AVAILABLE = False
+    print("OpenRouter will use OpenAI client for API calls.")
+
 load_dotenv()
 
 # Vector params for OpenAI's text-embedding-3-small
@@ -259,6 +267,22 @@ class EnhancedRAG:
         else:
             print(f"⚠️ Model {default_llm_model_name} may not support vision capabilities. Image processing may be limited.")
     
+        # Initialize OpenRouter API key and client
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.openrouter_url = "https://openrouter.ai/api/v1"
+        self.openrouter_client = None
+        if self.openrouter_api_key:
+            # OpenRouter uses the OpenAI SDK with a different base URL
+            self.openrouter_client = AsyncOpenAI(
+                api_key=self.openrouter_api_key,
+                base_url=self.openrouter_url,
+                timeout=timeout_config,
+                max_retries=1
+            )
+            print(f"✅ OpenRouter client initialized successfully")
+        else:
+            print(f"❌ No OpenRouter API key provided. OpenRouter will be disabled.")
+
     def _get_user_qdrant_collection_name(self, session_id: str) -> str:
         safe_session_id = "".join(c if c.isalnum() else '_' for c in session_id)
         return f"user_{safe_session_id}".replace("-", "_").lower()
@@ -858,6 +882,66 @@ class EnhancedRAG:
         messages.append({"role": "user", "content": user_query_message_content})
 
         user_memory = await self._get_user_memory(session_id)
+        
+        # Check if it's an OpenRouter model (various model names supported by OpenRouter)
+        use_openrouter = (self.openrouter_client is not None and 
+                         (normalized_model.startswith("openai/") or 
+                          normalized_model.startswith("anthropic/") or
+                          normalized_model.startswith("meta-llama/") or
+                          normalized_model.startswith("google/") or
+                          normalized_model.startswith("mistral/") or
+                          "openrouter" in normalized_model))
+
+        # Special case: Handle router-engine and OpenRouter routing models
+        if normalized_model == "router-engine" or normalized_model.startswith("openrouter/"):
+            if normalized_model == "router-engine":
+                print(f"Converting 'router-engine' to 'openrouter/auto' for OpenRouter routing")
+                current_llm_model = "openrouter/auto"  # Use OpenRouter's auto-routing
+            # If it already starts with "openrouter/", keep it as is
+            use_openrouter = True
+
+        if use_openrouter:
+            # Implementation for OpenRouter models (stream and non-stream)
+            if stream:
+                async def openrouter_stream_generator():
+                    full_response_content = ""
+                    try:
+                        response_stream = await self.openrouter_client.chat.completions.create(
+                            model=current_llm_model, 
+                            messages=messages, 
+                            temperature=self.default_temperature,
+                            stream=True
+                        )
+                        
+                        async for chunk in response_stream:
+                            content_piece = chunk.choices[0].delta.content
+                            if content_piece:
+                                full_response_content += content_piece
+                                yield content_piece
+                    except Exception as e_stream:
+                        print(f"OpenRouter streaming error: {e_stream}")
+                        yield f"I apologize, but I couldn't process your request successfully with OpenRouter. Please try asking in a different way."
+                    finally:
+                        await asyncio.to_thread(user_memory.add_user_message, query)
+                        await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
+                return openrouter_stream_generator()
+            else:
+                response_content = ""
+                try:
+                    completion = await self.openrouter_client.chat.completions.create(
+                        model=current_llm_model, 
+                        messages=messages, 
+                        temperature=self.default_temperature,
+                        stream=False
+                    )
+                    response_content = completion.choices[0].message.content or ""
+                except Exception as e_nostream:
+                    print(f"OpenRouter non-streaming error: {e_nostream}")
+                    response_content = f"Error with OpenRouter: {str(e_nostream)}"
+                
+                await asyncio.to_thread(user_memory.add_user_message, query)
+                await asyncio.to_thread(user_memory.add_ai_message, response_content)
+                return response_content
         
         # GPT-4o or GPT-4o-mini models (OpenAI)
         if current_llm_model.startswith("gpt-"):

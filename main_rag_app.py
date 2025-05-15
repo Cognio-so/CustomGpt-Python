@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
 from storage import CloudflareR2Storage
-from rag import EnhancedRAG
+from rag import EnhancedRAG, CLAUDE_AVAILABLE, BM25_AVAILABLE
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 
@@ -153,6 +153,7 @@ async def get_or_create_rag_instance(
             claude_api_key = api_keys.get('claude') if api_keys and 'claude' in api_keys else os.getenv("ANTHROPIC_API_KEY")
             gemini_api_key = api_keys.get('gemini') if api_keys and 'gemini' in api_keys else os.getenv("GOOGLE_API_KEY")
             groq_api_key = api_keys.get('groq') if api_keys and 'groq' in api_keys else os.getenv("GROQ_API_KEY")
+            openrouter_api_key = api_keys.get('openrouter') if api_keys and 'openrouter' in api_keys else os.getenv("OPENROUTER_API_KEY")
 
             active_rag_sessions[gpt_id] = EnhancedRAG(
                 gpt_id=gpt_id,
@@ -193,6 +194,32 @@ async def get_or_create_rag_instance(
                     from groq import AsyncGroq
                     rag_instance.groq_client = AsyncGroq(api_key=groq_api_key)
                     print(f"✅ Groq client reinitialized with user-provided API key")
+
+            if openrouter_api_key and hasattr(rag_instance, "openrouter_api_key"):
+                rag_instance.openrouter_api_key = openrouter_api_key
+                # Reinitialize OpenRouter client if possible
+                if hasattr(rag_instance, "openrouter_client"):
+                    try:
+                        import httpx
+                        from openai import AsyncOpenAI
+                        timeout_config = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
+                        rag_instance.openrouter_client = AsyncOpenAI(
+                            api_key=openrouter_api_key,
+                            base_url="https://openrouter.ai/api/v1",
+                            timeout=timeout_config,
+                            max_retries=1
+                        )
+                        print(f"✅ OpenRouter client reinitialized with user-provided API key")
+                    except Exception as e:
+                        print(f"❌ Error reinitializing OpenRouter client: {e}")
+
+            # Update other API keys similarly if they exist in the instance
+            for key_name in ['claude', 'gemini', 'groq', 'tavily', 'openrouter']:
+                if key_name in api_keys and api_keys[key_name] and hasattr(rag_instance, f"{key_name}_api_key"):
+                    attr_name = f"{key_name}_api_key"
+                    if getattr(rag_instance, attr_name) != api_keys[key_name]:
+                        setattr(rag_instance, attr_name, api_keys[key_name])
+                        print(f"✅ Updated {key_name} API key for RAG instance {gpt_id}")
         else:
             rag_instance = active_rag_sessions[gpt_id]
             if default_model:
@@ -227,7 +254,7 @@ async def get_or_create_rag_instance(
                                 print(f"❌ Error reinitializing OpenAI client: {e}")
                 
                 # Update other API keys similarly if they exist in the instance
-                for key_name in ['claude', 'gemini', 'groq', 'tavily']:
+                for key_name in ['claude', 'gemini', 'groq', 'tavily', 'openrouter']:
                     if key_name in api_keys and api_keys[key_name] and hasattr(rag_instance, f"{key_name}_api_key"):
                         attr_name = f"{key_name}_api_key"
                         if getattr(rag_instance, attr_name) != api_keys[key_name]:
