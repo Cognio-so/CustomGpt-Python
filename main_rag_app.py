@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
 from storage import CloudflareR2Storage
-from rag import EnhancedRAG, CLAUDE_AVAILABLE, BM25_AVAILABLE
+from rag import EnhancedRAG, CLAUDE_AVAILABLE, BM25_AVAILABLE, GEMINI_AVAILABLE, GROQ_AVAILABLE
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 
@@ -91,6 +91,9 @@ class ChatPayload(BaseModel):
     model: Optional[str] = None
     system_prompt: Optional[str] = None
     web_search_enabled: Optional[bool] = False
+    mcp_enabled: Optional[bool] = False
+    mcp_schema: Optional[str] = None
+    api_keys: Optional[Dict[str, str]] = Field(default_factory=dict)  # Add API keys field
 
 class ChatStreamRequest(BaseRAGRequest, ChatPayload):
     memory: Optional[List[Dict[str, str]]] = []
@@ -103,6 +106,8 @@ class GptContextSetupRequest(BaseRAGRequest):
     default_model: Optional[str] = None
     default_system_prompt: Optional[str] = None
     default_use_hybrid_search: Optional[bool] = False
+    mcp_enabled_config: Optional[bool] = Field(None, alias="mcpEnabled")
+    mcp_schema_config: Optional[str] = Field(None, alias="mcpSchema")
 
 class FileUploadInfoResponse(BaseModel):
     filename: str
@@ -116,8 +121,8 @@ class GptOpenedRequest(BaseModel):
     gpt_name: str
     file_urls: List[str] = []
     use_hybrid_search: bool = False
-    config_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")  # Renamed to avoid shadowing
-    api_keys: Optional[Dict[str, str]] = Field(default_factory=dict)  # Add API keys field
+    config_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
+    api_keys: Optional[Dict[str, str]] = Field(default_factory=dict)
 
 # --- Helper Functions ---
 def get_session_id(user_email: str, gpt_id: str) -> str:
@@ -131,6 +136,8 @@ async def get_or_create_rag_instance(
     default_model: Optional[str] = None,
     default_system_prompt: Optional[str] = None,
     default_use_hybrid_search: Optional[bool] = False,
+    initial_mcp_enabled_config: Optional[bool] = None,
+    initial_mcp_schema_config: Optional[str] = None,
     api_keys: Optional[Dict[str, str]] = None
 ) -> EnhancedRAG:
     async with sessions_lock:
@@ -165,7 +172,9 @@ async def get_or_create_rag_instance(
                 temp_processing_path=TEMP_DOWNLOAD_PATH,
                 default_system_prompt=default_system_prompt,
                 default_use_hybrid_search=default_use_hybrid_search,
-                tavily_api_key=tavily_api_key
+                tavily_api_key=tavily_api_key,
+                initial_mcp_enabled_config=initial_mcp_enabled_config,
+                initial_mcp_schema_config=initial_mcp_schema_config
             )
             
             # Update API keys for other providers if available
@@ -302,50 +311,44 @@ async def _process_uploaded_file_to_r2(
 
 # --- API Endpoints ---
 
-@app.post("/setup-gpt-context", summary="Initialize/update a GPT's knowledge base from URLs")
+@app.post("/setup-gpt-context", summary="Initialize/update a GPT's knowledge base from URLs and set defaults")
 async def setup_gpt_context_endpoint(request: GptContextSetupRequest, background_tasks: BackgroundTasks):
-    rag_instance = await get_or_create_rag_instance(
-        user_email=request.user_email,
-        gpt_id=request.gpt_id,
-        gpt_name=request.gpt_name,
-        default_model=request.default_model,
-        default_system_prompt=request.default_system_prompt,
-        default_use_hybrid_search=request.default_use_hybrid_search
-    )
+    print(f"Received setup GPT context request for GPT ID: {request.gpt_id}, User: {request.user_email}")
+    print(f"KB URLs: {request.kb_document_urls}, Model: {request.default_model}, Prompt: {request.default_system_prompt}, Hybrid: {request.default_use_hybrid_search}")
+    print(f"MCP Enabled Config: {request.mcp_enabled_config}, MCP Schema Config Present: {bool(request.mcp_schema_config)}")
 
-    if request.kb_document_urls:
+    try:
+        rag_instance = await get_or_create_rag_instance(
+            request.user_email,
+            request.gpt_id,
+            request.gpt_name,
+            default_model=request.default_model,
+            default_system_prompt=request.default_system_prompt,
+            default_use_hybrid_search=request.default_use_hybrid_search,
+            initial_mcp_enabled_config=request.mcp_enabled_config,
+            initial_mcp_schema_config=request.mcp_schema_config
+        )
+
         async def _process_kb_urls_task(urls: List[str], rag: EnhancedRAG):
-            print(f"BG Task: Processing {len(urls)} KB URLs for gpt_id '{rag.gpt_id}'...")
-            r2_kb_keys_or_urls_for_indexing = []
-            for url in urls:
-                if not (url.startswith('http://') or url.startswith('https://')):
-                    print(f"Skipping invalid KB URL: {url}")
-                    continue
-                success, r2_path = await asyncio.to_thread(
-                    r2_storage.download_file_from_url, url=url
-                )
-                if success:
-                    r2_kb_keys_or_urls_for_indexing.append(r2_path)
-                    print(f"KB URL '{url}' processed to R2: {r2_path}")
-                else:
-                    print(f"Failed to process KB URL '{url}'. Error: {r2_path}")
-            
-            if r2_kb_keys_or_urls_for_indexing:
-                try:
-                    await rag.update_knowledge_base_from_r2(r2_kb_keys_or_urls_for_indexing)
-                except Exception as e:
-                    print(f"Error indexing KB documents for gpt_id '{rag.gpt_id}': {e}")
+            if urls:
+                print(f"Background task: Updating KB for GPT {rag.gpt_id} with {len(urls)} URLs.")
+                await rag.update_knowledge_base_from_r2(urls)
+                print(f"Background task: KB update finished for GPT {rag.gpt_id}.")
+            else:
+                print(f"Background task: No URLs provided for KB update for GPT {rag.gpt_id}.")
 
-        background_tasks.add_task(_process_kb_urls_task, request.kb_document_urls, rag_instance)
-        return JSONResponse(status_code=202, content={
-            "message": f"KB processing for gpt_id '{request.gpt_id}' initiated for {len(request.kb_document_urls)} URLs.",
-            "gpt_id": request.gpt_id
-        })
-    else:
-        return JSONResponse(status_code=200, content={
-            "message": f"No KB URLs provided. RAG instance for gpt_id '{request.gpt_id}' is ready.",
-            "gpt_id": request.gpt_id
-        })
+        if request.kb_document_urls:
+            background_tasks.add_task(_process_kb_urls_task, request.kb_document_urls, rag_instance)
+            return JSONResponse(content={"success": True, "message": "Knowledge base update initiated in background.", "collection_name": rag_instance.kb_collection_name})
+        else:
+            # Ensure instance is created/updated even if no URLs are processed immediately
+             return JSONResponse(content={"success": True, "message": "GPT context (defaults, MCP config) initialized/updated. No KB URLs to process.", "collection_name": rag_instance.kb_collection_name if rag_instance.kb_retriever else None})
+
+    except Exception as e:
+        print(f"Error in setup_gpt_context_endpoint for GPT {request.gpt_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to setup GPT context: {str(e)}")
 
 @app.post("/upload-documents", summary="Upload documents (KB or User-specific) including images")
 async def upload_documents_endpoint(
@@ -388,7 +391,7 @@ async def upload_documents_endpoint(
     async def _index_documents_task(rag: EnhancedRAG, keys_or_urls: List[str], is_user_specific: bool, u_email: str, g_id: str):
         doc_type = "user-specific" if is_user_specific else "knowledge base"
         s_id = get_session_id(u_email, g_id)
-        print(f"BG Task: Indexing {len(keys_or_urls)} {doc_type} documents for gpt_id '{rag.gpt_id}' (session '{s_id}')...")
+        print(f"BG Task: Indexing {len(keys_or_urls)} {doc_type} documents for gpt_id '{g_id}' (session '{s_id}')...")
         try:
             if is_user_specific:
                 await rag.update_user_documents_from_r2(session_id=s_id, r2_keys_or_urls=keys_or_urls)
@@ -396,9 +399,9 @@ async def upload_documents_endpoint(
                 await rag.update_knowledge_base_from_r2(keys_or_urls)
             print(f"BG Task: Indexing complete for {doc_type} documents.")
         except Exception as e:
-            print(f"BG Task: Error indexing {doc_type} documents for gpt_id '{rag.gpt_id}': {e}")
+            print(f"BG Task: Error indexing {doc_type} documents for gpt_id '{g_id}': {e}")
 
-    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_email, gpt_id)
+    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_email)
 
     return JSONResponse(status_code=202, content={
         "message": f"{len(r2_keys_or_urls_for_indexing)} files accepted for {'user-specific' if is_user_doc_bool else 'knowledge base'} indexing. Processing in background.",
@@ -408,77 +411,72 @@ async def upload_documents_endpoint(
 @app.post("/chat-stream")
 async def chat_stream(request: ChatStreamRequest):
     try:
-        # Initialize rag_instance
-        rag_instance = await get_or_create_rag_instance(
+        session_id = get_session_id(request.user_email, request.gpt_id)
+        
+        print(f"Chat stream request from {request.user_email} for GPT {request.gpt_id}")
+        print(f"MCP enabled: {request.mcp_enabled}")
+        if request.mcp_enabled and request.mcp_schema:
+            try:
+                mcp_config = json.loads(request.mcp_schema)
+                print(f"MCP config received - Command: {mcp_config.get('command', 'NOT_FOUND')}")
+                print(f"MCP config keys: {list(mcp_config.keys())}")
+            except Exception as e:
+                print(f"Error parsing MCP schema: {e}")
+        
+        rag = await get_or_create_rag_instance(
             user_email=request.user_email,
             gpt_id=request.gpt_id,
             gpt_name=request.gpt_name,
-            default_model=request.model,
-            default_system_prompt=request.system_prompt,
-            default_use_hybrid_search=request.use_hybrid_search
+            api_keys=request.api_keys
         )
         
-        session_id = get_session_id(request.user_email, request.gpt_id)
-
-        print(f"\n{'='*40}")
-        print(f"📝 New chat request from user: {request.user_email}")
-        print(f"🔍 GPT ID: {request.gpt_id}")
-        print(f"💬 Query: '{request.message}'")
-        if request.web_search_enabled:
-            print(f"🌐 Web search requested: ENABLED")
-        else:
-            print(f"🌐 Web search requested: DISABLED")
-        print(f"{'='*40}\n")
-
-        # Setup SSE headers
-        headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-
-        # Create streaming response generator
         async def generate():
-            try:
-                async for chunk in rag_instance.query_stream(
-                    session_id=session_id,
-                    query=request.message,
-                    chat_history=request.history,
-                    user_r2_document_keys=request.user_document_keys,
-                    use_hybrid_search=request.use_hybrid_search,
-                    llm_model_name=request.model,
-                    system_prompt_override=request.system_prompt,
-                    enable_web_search=request.web_search_enabled
-                ):
+            async for chunk in rag.query_stream(
+                session_id=session_id,
+                query=request.message,
+                chat_history=request.history,
+                user_r2_document_keys=request.user_document_keys,
+                use_hybrid_search=request.use_hybrid_search,
+                llm_model_name=request.model,
+                system_prompt_override=request.system_prompt,
+                enable_web_search=request.web_search_enabled,
+                mcp_enabled=request.mcp_enabled,
+                mcp_schema=request.mcp_schema,
+                api_keys=request.api_keys
+            ):
+                if chunk["type"] == "error":
+                    yield f"data: {json.dumps({'error': chunk['text']})}\n\n"
+                else:
                     yield f"data: {json.dumps(chunk)}\n\n"
-            except Exception as e:
-                print(f"❌ Error during streaming in /chat-stream: {e}")
-                error_chunk = {
-                    "type": "error",
-                    "data": {"error": str(e)}
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
 
-        return StreamingResponse(generate(), headers=headers)
-    
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream"
+        )
+                    
     except Exception as e:
-        print(f"❌ Error in /chat-stream endpoint: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
+        error_message = f"Error in chat stream: {str(e)}"
+        print(error_message)
+        return StreamingResponse(
+            (f"data: {json.dumps({'error': error_message})}\n\n" for _ in range(1)),
+            media_type="text/event-stream"
         )
 
 @app.post("/chat", summary="Handle non-streaming chat requests")
 async def chat_endpoint(request: ChatRequest):
-    rag_instance = await get_or_create_rag_instance(
-        user_email=request.user_email, gpt_id=request.gpt_id, gpt_name=request.gpt_name,
-        default_model=request.model,
-        default_system_prompt=request.system_prompt,
-        default_use_hybrid_search=request.use_hybrid_search
-    )
-    session_id = get_session_id(request.user_email, request.gpt_id)
     try:
-        response_data = await rag_instance.query(
+        session_id = get_session_id(request.user_email, request.gpt_id)
+        
+        rag = await get_or_create_rag_instance(
+            user_email=request.user_email,
+            gpt_id=request.gpt_id,
+            gpt_name=request.gpt_name,
+            api_keys=request.api_keys
+        )
+        
+        # Get full response using the existing query method, which will
+        # now utilize the auto-detection if mcp_enabled is None
+        response = await rag.query(
             session_id=session_id,
             query=request.message,
             chat_history=request.history,
@@ -488,51 +486,90 @@ async def chat_endpoint(request: ChatRequest):
             system_prompt_override=request.system_prompt,
             enable_web_search=request.web_search_enabled
         )
-        return JSONResponse(content={"success": True, "data": response_data})
+        
+        return response
+        
     except Exception as e:
-        print(f"Error in /chat endpoint: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        error_message = f"Error in chat endpoint: {str(e)}"
+        print(error_message)
+        return JSONResponse(
+            status_code=500,
+            content={"error": error_message}
+        )
 
-@app.post("/gpt-opened", summary="Notify backend when a GPT is opened")
+@app.post("/gpt-opened", summary="Notify backend when a GPT is opened, ensure context is set up.")
 async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: BackgroundTasks):
+    session_id = get_session_id(request.user_email, request.gpt_id)
+    print(f"GPT opened: ID={request.gpt_id}, Name='{request.gpt_name}', User={request.user_email}")
+    print(f"Config Schema provided: {bool(request.config_schema)}")
+    print(f"API Keys provided for context: {bool(request.api_keys)}")
+
+    gpt_model = None
+    gpt_instructions = None
+    gpt_mcp_enabled_config = False
+    gpt_mcp_schema_config_str = None
+
+    if request.config_schema:
+        gpt_model = request.config_schema.get("model")
+        gpt_instructions = request.config_schema.get("instructions")
+        # Extract full MCP config
+        gpt_mcp_enabled_config = request.config_schema.get("mcpEnabled", False)
+        mcp_schema_from_config = request.config_schema.get("mcpSchema")
+        
+        if mcp_schema_from_config is not None:
+            if isinstance(mcp_schema_from_config, str):
+                gpt_mcp_schema_config_str = mcp_schema_from_config
+            else: # If it's a dict/object, serialize it
+                try:
+                    gpt_mcp_schema_config_str = json.dumps(mcp_schema_from_config)
+                except Exception as e_ser:
+                    print(f"Warning: Could not serialize mcpSchema from config_schema to JSON string for GPT {request.gpt_id}: {e_ser}")
+                    gpt_mcp_schema_config_str = None
+        
+        print(f"  Model: {gpt_model}, HybridSearch: {request.use_hybrid_search}")
+        print(f"  MCP Enabled (from config_schema): {gpt_mcp_enabled_config}")
+        print(f"  MCP Schema (from config_schema) present: {bool(gpt_mcp_schema_config_str)}")
+
+
     try:
         rag_instance = await get_or_create_rag_instance(
             user_email=request.user_email,
             gpt_id=request.gpt_id,
             gpt_name=request.gpt_name,
-            default_model=request.config_schema.get("model") if request.config_schema else None,
-            default_system_prompt=request.config_schema.get("instructions") if request.config_schema else None,
-            default_use_hybrid_search=request.config_schema.get("capabilities", {}).get("hybridSearch", False) if request.config_schema else request.use_hybrid_search,
-            api_keys=request.api_keys if hasattr(request, "api_keys") else None  # Pass API keys to the function
+            default_model=gpt_model,
+            default_system_prompt=gpt_instructions,
+            default_use_hybrid_search=request.use_hybrid_search, # From GptOpenedRequest directly
+            initial_mcp_enabled_config=gpt_mcp_enabled_config, # Full MCP config
+            initial_mcp_schema_config=gpt_mcp_schema_config_str, # Full MCP schema
+            api_keys=request.api_keys # API keys passed from frontend user settings
         )
-        
-        sanitized_email = request.user_email.replace('@', '_').replace('.', '_')
-        sanitized_gpt_name = (request.gpt_name or 'gpt').replace(' ', '_').replace('-', '_')
-        collection_name = f"kb_{sanitized_email}_{sanitized_gpt_name}_{request.gpt_id}"
-        
-        if request.file_urls:
-            async def _process_kb_urls_task(urls: List[str], rag: EnhancedRAG):
-                r2_kb_keys_or_urls_for_indexing = []
-                for url in urls:
-                    if url.startswith('http://') or url.startswith('https://'):
-                        success, r2_path = await asyncio.to_thread(
-                            r2_storage.download_file_from_url, url=url
-                        )
-                        if success:
-                            r2_kb_keys_or_urls_for_indexing.append(r2_path)
-                
-                if r2_kb_keys_or_urls_for_indexing:
-                    try:
-                        await rag.update_knowledge_base_from_r2(r2_kb_keys_or_urls_for_indexing)
-                    except Exception as e:
-                        print(f"Error indexing KB documents for gpt_id '{rag.gpt_id}': {e}")
-            
+
+        async def _process_kb_urls_task(urls: List[str], rag: EnhancedRAG):
+            if urls:
+                print(f"Background task (gpt-opened): Updating KB for GPT {rag.gpt_id} with {len(urls)} URLs.")
+                await rag.update_knowledge_base_from_r2(urls)
+                print(f"Background task (gpt-opened): KB update finished for GPT {rag.gpt_id}.")
+            else:
+                print(f"Background task (gpt-opened): No KB URLs to process for GPT {rag.gpt_id}.")
+
+        if request.file_urls: # These are KB files for the GPT
             background_tasks.add_task(_process_kb_urls_task, request.file_urls, rag_instance)
         
-        return {"success": True, "collection_name": collection_name}
+        return JSONResponse(content={
+            "success": True,
+            "message": f"GPT '{request.gpt_name}' context initialized/updated for user {request.user_email}.",
+            "collection_name": rag_instance.kb_collection_name,
+            "session_id": session_id,
+            "mcp_config_loaded": {
+                "enabled": rag_instance.gpt_mcp_enabled_config,
+                "schema_present": bool(rag_instance.gpt_mcp_full_schema_str)
+            }
+        })
     except Exception as e:
-        print(f"Error in gpt-opened endpoint: {e}")
-        return {"success": False, "error": str(e)}
+        print(f"Error in gpt_opened_endpoint for GPT {request.gpt_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to handle GPT opened event: {str(e)}")
 
 @app.post("/upload-chat-files", summary="Upload files for chat including images")
 async def upload_chat_files_endpoint(
@@ -650,5 +687,73 @@ async def manual_cleanup_r2():
             status_code=500,
             content={"status": "error", "message": f"Error during R2 cleanup: {str(e)}"}
         )
+
+@app.post("/index-knowledge")
+async def index_knowledge_endpoint(
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    try:
+        # Parse request body
+        data = await request.json()
+        gpt_id = data.get("gpt_id")
+        file_urls = data.get("file_urls", [])
+        user_email = data.get("user_email", "user@example.com")
+        system_prompt = data.get("system_prompt", "")
+        use_hybrid_search = data.get("use_hybrid_search", False)
+        schema = data.get("schema", {})
+        
+        if not gpt_id:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Missing gpt_id parameter"}
+            )
+        
+        # Initialize RAG instance
+        rag_instance = await get_or_create_rag_instance(
+            user_email=user_email,
+            gpt_id=gpt_id,
+            gpt_name=schema.get("name", "Custom GPT"),
+            default_model=schema.get("model"),
+            default_system_prompt=system_prompt,
+            default_use_hybrid_search=use_hybrid_search
+        )
+        
+        # Process files in background
+        async def _process_kb_urls_task(urls: List[str], rag: EnhancedRAG):
+            print(f"BG Task: Processing {len(urls)} KB URLs for gpt_id '{rag.gpt_id}'...")
+            r2_kb_keys_or_urls_for_indexing = []
+            for url in urls:
+                if not (url.startswith('http://') or url.startswith('https://')):
+                    print(f"Skipping invalid KB URL: {url}")
+                    continue
+                success, r2_path = await asyncio.to_thread(
+                    r2_storage.download_file_from_url, url=url
+                )
+                if success:
+                    r2_kb_keys_or_urls_for_indexing.append(r2_path)
+                    print(f"KB URL '{url}' processed to R2: {r2_path}")
+                else:
+                    print(f"Failed to process KB URL '{url}'. Error: {r2_path}")
+            
+            if r2_kb_keys_or_urls_for_indexing:
+                try:
+                    await rag.update_knowledge_base_from_r2(r2_kb_keys_or_urls_for_indexing)
+                except Exception as e:
+                    print(f"Error indexing KB documents for gpt_id '{rag.gpt_id}': {e}")
+        
+        # Start background task for file processing
+        if file_urls:
+            background_tasks.add_task(_process_kb_urls_task, file_urls, rag_instance)
+        
+        return {"success": True, "message": f"Indexing started for {len(file_urls)} files"}
+    
+    except Exception as e:
+        print(f"Error in index-knowledge endpoint: {e}")
+        return JSONResponse(
+            status_code=500, 
+            content={"success": False, "error": str(e)}
+        )
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

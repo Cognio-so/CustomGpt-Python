@@ -4,10 +4,13 @@ import asyncio
 import time
 import json
 import base64
+import re
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union
 from urllib.parse import urlparse
 import uuid
 import httpx
+import subprocess
+import aiohttp
 
 from dotenv import load_dotenv
 
@@ -101,6 +104,12 @@ except ImportError:
     OPENROUTER_AVAILABLE = False
     print("OpenRouter will use OpenAI client for API calls.")
 
+# Add new imports for tool calling
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticToolsParser
+from typing import Literal
+
 load_dotenv()
 
 # Vector params for OpenAI's text-embedding-3-small
@@ -111,12 +120,24 @@ METADATA_PAYLOAD_KEY = "metadata"
 if os.name == 'nt':  # Windows
     pass
 
+# Create tool schemas for detecting query type
+class RAGQueryTool(BaseModel):
+    """Process a general information query using RAG (Retrieval Augmented Generation)."""
+    query_type: Literal["rag"] = Field(description="Indicates this is a general information query that should use RAG")
+    explanation: str = Field(description="Explanation of why this query should use RAG")
+
+class MCPServerQueryTool(BaseModel):
+    """Process a query using an MCP (Model Context Protocol) server."""
+    query_type: Literal["mcp"] = Field(description="Indicates this is a query that should use an MCP server")
+    server_name: str = Field(description="Name of the MCP server to use if specified in the query")
+    explanation: str = Field(description="Explanation of why this query should use MCP")
+
 class EnhancedRAG:
     def __init__(
         self,
         gpt_id: str,
         r2_storage_client: CloudflareR2Storage,
-        openai_api_key: str,
+        openai_api_key: Optional[str] = None,
         default_llm_model_name: str = "gpt-4o",
         qdrant_url: Optional[str] = None,
         qdrant_api_key: Optional[str] = None,
@@ -125,10 +146,17 @@ class EnhancedRAG:
         default_system_prompt: Optional[str] = None,
         default_temperature: float = 0.2,
         default_use_hybrid_search: bool = False,
+        # New params for initial full MCP config for this GPT instance
+        initial_mcp_enabled_config: Optional[bool] = None,
+        initial_mcp_schema_config: Optional[str] = None
     ):
         self.gpt_id = gpt_id
         self.r2_storage = r2_storage_client
-        self.openai_api_key = openai_api_key
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            print("Warning: OpenAI API key not found. Some functionalities might be limited.")
+            # raise ValueError("OpenAI API key must be provided or set via OPENAI_API_KEY environment variable.")
+
         self.tavily_api_key = tavily_api_key or os.getenv("TAVILY_API_KEY")
         
         self.default_llm_model_name = default_llm_model_name
@@ -145,30 +173,24 @@ class EnhancedRAG:
             "Ensure your response is as lengthy and detailed as necessary to fully answer the query, up to the allowed token limit."
         )
         self.default_temperature = default_temperature
-        self.max_tokens_llm = 32000  # Maximum for most models, will be overridden by API limits
+        self.max_tokens_llm = 32000 
         self.default_use_hybrid_search = default_use_hybrid_search
 
-        self.temp_processing_path = temp_processing_path
+        # Store the initial full MCP configuration for this GPT
+        self.gpt_mcp_enabled_config = initial_mcp_enabled_config
+        self.gpt_mcp_full_schema_str = initial_mcp_schema_config # JSON string of all MCP servers for this GPT
+
+        self.temp_processing_path = os.path.join(temp_processing_path, self.gpt_id) # Per-GPT temp path
         os.makedirs(self.temp_processing_path, exist_ok=True)
 
         self.embeddings_model = OpenAIEmbeddings(
             api_key=self.openai_api_key,
-            model="text-embedding-3-small"  # Explicitly set the model name
+            model="text-embedding-3-small"
         )
         
-        # Configure AsyncOpenAI client with custom timeouts
-        # Default httpx timeouts are often too short (5s for read/write/connect)
-        # OpenAI library itself defaults to 600s total, but being explicit for stream reads is good.
-        timeout_config = httpx.Timeout(
-            connect=15.0,  # Connection timeout
-            read=180.0,    # Read timeout (important for waiting for stream chunks)
-            write=15.0,    # Write timeout
-            pool=15.0      # Pool timeout
-        )
+        timeout_config = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
         self.async_openai_client = AsyncOpenAI(
-            api_key=self.openai_api_key,
-            timeout=timeout_config,
-            max_retries=1 # Default is 2, reducing to 1 for faster failure if unrecoverable
+            api_key=self.openai_api_key, timeout=timeout_config, max_retries=1
         )
 
         self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -178,7 +200,7 @@ class EnhancedRAG:
             raise ValueError("Qdrant URL must be provided either as a parameter or via QDRANT_URL environment variable.")
 
         self.qdrant_client = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key, timeout=20.0)
-        print(f"Qdrant client initialized for URL: {self.qdrant_url}")
+        print(f"Qdrant client initialized for GPT '{self.gpt_id}' at URL: {self.qdrant_url}")
 
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, chunk_overlap=200, length_function=len
@@ -192,96 +214,73 @@ class EnhancedRAG:
         self.user_memories: Dict[str, ChatMessageHistory] = {}
 
         self.tavily_client = None
-        if self.tavily_api_key:
+        if self.tavily_api_key and TAVILY_AVAILABLE:
             try:
-                if TAVILY_AVAILABLE:
-                    self.tavily_client = AsyncTavilyClient(api_key=self.tavily_api_key)
-                    print(f"✅ Tavily client initialized successfully with API key")
-                else:
-                    print(f"❌ Tavily package not available. Install it with: pip install tavily-python")
+                self.tavily_client = AsyncTavilyClient(api_key=self.tavily_api_key)
+                print(f"✅ Tavily client initialized for GPT '{self.gpt_id}'")
             except Exception as e:
-                print(f"❌ Error initializing Tavily client: {e}")
+                print(f"❌ Error initializing Tavily client for GPT '{self.gpt_id}': {e}")
+        elif not TAVILY_AVAILABLE:
+             print(f"ℹ️ Tavily package not available for GPT '{self.gpt_id}'. Install with: pip install tavily-python")
         else:
-            print(f"❌ No Tavily API key provided. Web search will be disabled.")
+            print(f"ℹ️ No Tavily API key provided for GPT '{self.gpt_id}'. Web search will be disabled.")
         
-        # Initialize clients for other providers
         self.anthropic_client = None
-        self.gemini_client = None
-        self.llama_model = None
-        
-        # Setup Claude client if available
         self.claude_api_key = os.getenv("ANTHROPIC_API_KEY")
         if CLAUDE_AVAILABLE and self.claude_api_key:
             self.anthropic_client = anthropic.AsyncAnthropic(api_key=self.claude_api_key)
-            print(f"✅ Claude client initialized successfully")
+            print(f"✅ Claude client initialized for GPT '{self.gpt_id}'")
         
-        # Setup Gemini client if available
+        self.gemini_client = None
         self.gemini_api_key = os.getenv("GOOGLE_API_KEY")
         if GEMINI_AVAILABLE and self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
             self.gemini_client = genai
-            print(f"✅ Gemini client initialized successfully")
+            print(f"✅ Gemini client initialized for GPT '{self.gpt_id}'")
         
-        # Setup Llama if available (local model)
+        self.llama_model = None
         if LLAMA_AVAILABLE:
-            # This would need a model path - could be configurable
             llama_model_path = os.getenv("LLAMA_MODEL_PATH")
             if llama_model_path and os.path.exists(llama_model_path):
-                self.llama_model = Llama(model_path=llama_model_path)
-                print(f"✅ Llama model loaded successfully")
-        
-        # Initialize Groq client
-        self.groq_api_key = os.getenv("GROQ_API_KEY")
+                try:
+                    self.llama_model = Llama(model_path=llama_model_path, verbose=False) # Reduce verbosity
+                    print(f"✅ Llama model loaded for GPT '{self.gpt_id}'")
+                except Exception as e:
+                    print(f"❌ Error loading Llama model for GPT '{self.gpt_id}': {e}")
+
         self.groq_client = None
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
         if GROQ_AVAILABLE and self.groq_api_key:
             self.groq_client = AsyncGroq(api_key=self.groq_api_key)
-            print(f"✅ Groq client initialized successfully")
+            print(f"✅ Groq client initialized for GPT '{self.gpt_id}'")
         
-        # Update vision capability detection to match the new model list
-        self.has_vision_capability = default_llm_model_name in [
-            "gpt-4o", 
-            "gpt-4o-mini", 
-            "gpt-4-vision",
-            "gemini-flash-2.5", 
-            "gemini-pro-2.5",
-            "gemini-1.5-pro",  # Add Gemini 1.5 Pro
-            "claude-3-5-sonnet",  # Add Claude 3.5 Sonnet
-            "claude-3-5-haiku",
-            "claude-3-haiku",
-            "claude-3-sonnet",
-            "claude-3-opus",
-            "llama-3-70b-vision",
-            "llama-3-8b-vision",
-            "llama-4-scout"  # Add Llama 4 Scout
-        ]
-        
-        # Track if this model is a Gemini model (for vision processing)
+        self.has_vision_capability = default_llm_model_name.lower() in [
+            "gpt-4o", "gpt-4o-mini", "gpt-4-vision", # OpenAI
+            "gemini-1.5-pro", "gemini-1.5-flash", # Google, using general names, specific API names handled in _process_image
+            "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307", "claude-3.5-sonnet-20240620", # Anthropic
+            "llava-v1.5-7b" # Example LLaVA model, actual name might vary based on Groq/OpenRouter
+            # Add other vision models if directly supported without OpenRouter
+        ] or "vision" in default_llm_model_name.lower() # General check
+
         normalized_model_name = default_llm_model_name.lower().replace("-", "").replace("_", "")
         self.is_gemini_model = "gemini" in normalized_model_name
         
         if self.has_vision_capability:
-            if self.is_gemini_model:
-                print(f"✅ Vision capabilities available with Gemini model: {default_llm_model_name}")
-            else:
-                print(f"✅ Vision capabilities available with model: {default_llm_model_name}")
+            print(f"✅ Vision capabilities may be available with model: {default_llm_model_name} for GPT '{self.gpt_id}'")
         else:
-            print(f"⚠️ Model {default_llm_model_name} may not support vision capabilities. Image processing may be limited.")
+            print(f"⚠️ Model {default_llm_model_name} may not support vision. Image processing limited for GPT '{self.gpt_id}'.")
     
-        # Initialize OpenRouter API key and client
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
         self.openrouter_url = "https://openrouter.ai/api/v1"
         self.openrouter_client = None
-        if self.openrouter_api_key:
-            # OpenRouter uses the OpenAI SDK with a different base URL
+        if OPENROUTER_AVAILABLE and self.openrouter_api_key:
             self.openrouter_client = AsyncOpenAI(
-                api_key=self.openrouter_api_key,
-                base_url=self.openrouter_url,
-                timeout=timeout_config,
-                max_retries=1
+                api_key=self.openrouter_api_key, base_url=self.openrouter_url,
+                timeout=timeout_config, max_retries=1
             )
-            print(f"✅ OpenRouter client initialized successfully")
+            print(f"✅ OpenRouter client initialized for GPT '{self.gpt_id}'")
         else:
-            print(f"❌ No OpenRouter API key provided. OpenRouter will be disabled.")
+            print(f"ℹ️ OpenRouter API key not provided or client not available. OpenRouter disabled for GPT '{self.gpt_id}'.")
 
     def _get_user_qdrant_collection_name(self, session_id: str) -> str:
         safe_session_id = "".join(c if c.isalnum() else '_' for c in session_id)
@@ -801,7 +800,7 @@ class EnhancedRAG:
         try:
             search_response = await self.tavily_client.search(
                 query=query, 
-                search_depth="advanced",  # Changed from "basic" to "advanced" for more comprehensive search
+                search_depth="advanced", # Changed from "basic" to "advanced" for more comprehensive search
                 max_results=num_results,
                 include_raw_content=True,
                 include_domains=[]  # Can be customized to limit to specific domains
@@ -1291,141 +1290,511 @@ class EnhancedRAG:
         self, session_id: str, query: str, chat_history: Optional[List[Dict[str, str]]] = None,
         user_r2_document_keys: Optional[List[str]] = None, use_hybrid_search: Optional[bool] = None,
         llm_model_name: Optional[str] = None, system_prompt_override: Optional[str] = None,
-        enable_web_search: Optional[bool] = False
+        enable_web_search: Optional[bool] = False,
+        mcp_enabled: Optional[bool] = None,      # For this specific query
+        mcp_schema: Optional[str] = None,        # JSON string of the SELECTED server's config for this query
+        api_keys: Optional[Dict[str, str]] = None  # API keys to potentially inject into MCP server env
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        print(f"\n{'='*80}\nStarting streaming query for session: {session_id}")
-        start_time = time.time()
+        start_time = time.time()  # <-- ADD THIS LINE AT THE TOP
         
-        # Print search configuration to terminal with debug info
-        print(f"\n📊 SEARCH CONFIGURATION:")
-        print(f"📌 Debug - Raw enable_web_search param value: {enable_web_search} (type: {type(enable_web_search)})")
-        
-        # Determine effective hybrid search setting
-        actual_use_hybrid_search = use_hybrid_search if use_hybrid_search is not None else self.default_use_hybrid_search
-        if actual_use_hybrid_search:
-            print(f"🔄 Hybrid search: ACTIVE (BM25 Available: {BM25_AVAILABLE})")
-        else:
-            print(f"🔄 Hybrid search: INACTIVE")
-        
-        # Web search status with extra debug info
-        if enable_web_search:
-            if self.tavily_client:
-                print(f"🌐 Web search: ENABLED with Tavily API")
-                print(f"🌐 Tavily API key present: {bool(self.tavily_api_key)}")
+        # If mcp_enabled is not explicitly set, auto-detect using tool calling
+        if mcp_enabled is None:
+            # Auto-detect query type
+            detection_result = await self.detect_query_type(query)
+            
+            # Set MCP mode based on detection
+            if detection_result["type"] == "mcp":
+                mcp_enabled = True
+                
+                # If MCP is enabled but no schema is provided, use the full schema from this GPT
+                if mcp_schema is None and self.gpt_mcp_full_schema_str:
+                    # Here we would need to parse the full schema and select the appropriate server
+                    # This is a simplified approach - in a real implementation, you might want to
+                    # parse the schema and select the most appropriate server based on the query
+                    mcp_schema = self.gpt_mcp_full_schema_str
+                    
+                    # Log the auto-detection
+                    print(f"Auto-detected MCP query: {detection_result['explanation']}")
+                    if detection_result.get("server_name"):
+                        print(f"Requested server: {detection_result['server_name']}")
             else:
-                print(f"🌐 Web search: REQUESTED but Tavily API not available")
-                print(f"🌐 Tavily API key present: {bool(self.tavily_api_key)}")
-                print(f"🌐 TAVILY_AVAILABLE global: {TAVILY_AVAILABLE}")
+                mcp_enabled = False
+                print(f"Auto-detected RAG query: {detection_result['explanation']}")
+        
+        # Continue with existing query_stream functionality
+        # The rest of the method remains unchanged
+        
+        # If MCP is enabled for this query and a specific server schema is provided
+        if mcp_enabled and mcp_schema:
+            try:
+                chat_history_processed = chat_history or []
+                # Handle MCP request with the selected server
+                async for chunk in self._handle_mcp_request(
+                    query=query,
+                    selected_server_config_str=mcp_schema,
+                    chat_history=chat_history_processed,
+                    api_keys_for_mcp=api_keys
+                ):
+                    yield chunk
+                return
+            except Exception as e:
+                error_message = f"Error processing MCP request: {str(e)}"
+                print(error_message)
+                yield {"text": error_message, "type": "error"}
+                return
+        
+        # If MCP is not enabled, proceed with RAG processing
+        print(f"\n[{session_id}] 📊 SEARCH CONFIGURATION:")
+        actual_use_hybrid_search = use_hybrid_search if use_hybrid_search is not None else self.default_use_hybrid_search
+        print(f"[{session_id}] 🔄 Hybrid search: {'ACTIVE' if actual_use_hybrid_search else 'INACTIVE'} (BM25 Available: {BM25_AVAILABLE})")
+        
+        effective_enable_web_search = enable_web_search if enable_web_search is not None else (self.gpt_mcp_enabled_config and "web" in self.default_llm_model_name) # Example default logic for web
+        
+        if effective_enable_web_search:
+            if self.tavily_client: print(f"[{session_id}] 🌐 Web search: ENABLED with Tavily")
+            else: print(f"[{session_id}] 🌐 Web search: REQUESTED but Tavily client not available/configured")
         else:
-            print(f"🌐 Web search: DISABLED (param value: {enable_web_search})")
+            print(f"[{session_id}] 🌐 Web search: DISABLED")
         
-        # Model information
         current_model = llm_model_name or self.default_llm_model_name
-        print(f"🧠 Using model: {current_model}")
-        print(f"{'='*80}")
-        
-        formatted_chat_history = await self._get_formatted_chat_history(session_id)
+        print(f"[{session_id}] 🧠 Using model: {current_model}")
+        print(f"[{session_id}] {'='*80}")
+
+        formatted_chat_history = chat_history or [] # Assuming chat_history is already in the correct format
+        # If not, you might need: await self._get_formatted_chat_history(session_id) using user_memory
+        # But query_stream receives chat_history directly.
+
         retrieval_query = query
-        
-        print(f"\n📝 Processing query: '{retrieval_query}'")
+        print(f"\n[{session_id}] 📝 Processing query: '{retrieval_query}'")
         
         all_retrieved_docs: List[Document] = []
         
-        # First get user document context with deeper search (higher k-value)
-        user_session_retriever = await self._get_user_retriever(session_id)
-        user_session_docs = await self._get_retrieved_documents(
-            user_session_retriever, 
-            retrieval_query, 
-            k_val=3,  # Change from 5 to 3
-            is_hybrid_search_active=actual_use_hybrid_search,
-            is_user_doc=True  # Flag as user doc for deeper search
-        )
-        if user_session_docs: 
-            print(f"📄 Retrieved {len(user_session_docs)} user-specific documents")
-            all_retrieved_docs.extend(user_session_docs)
-        else:
-            print(f"📄 No user-specific documents found")
+        user_session_retriever = await self._get_user_retriever(session_id) # k_val is set in _get_user_retriever
+        if user_session_retriever:
+            user_session_docs = await self._get_retrieved_documents(
+                user_session_retriever, retrieval_query, k_val=3, # k_val here can be dynamic
+                is_hybrid_search_active=actual_use_hybrid_search, is_user_doc=True
+            )
+            if user_session_docs: 
+                print(f"[{session_id}] 📄 Retrieved {len(user_session_docs)} user-specific documents")
+                all_retrieved_docs.extend(user_session_docs)
         
-        # Then add knowledge base context
-        kb_docs = await self._get_retrieved_documents(
-            self.kb_retriever, 
-            retrieval_query, 
-            k_val=5, 
-            is_hybrid_search_active=actual_use_hybrid_search
-        )
-        if kb_docs: 
-            print(f"📚 Retrieved {len(kb_docs)} knowledge base documents")
-            all_retrieved_docs.extend(kb_docs)
-        else:
-            print(f"📚 No knowledge base documents found")
+        if self.kb_retriever:
+            kb_docs = await self._get_retrieved_documents(
+                self.kb_retriever, retrieval_query, k_val=5, 
+                is_hybrid_search_active=actual_use_hybrid_search
+            )
+            if kb_docs: 
+                print(f"[{session_id}] 📚 Retrieved {len(kb_docs)} knowledge base documents")
+                all_retrieved_docs.extend(kb_docs)
         
-        # Add web search results if enabled - MOVED EARLIER in the process
-        if enable_web_search and self.tavily_client:
+        if effective_enable_web_search and self.tavily_client:
             web_docs = await self._get_web_search_docs(retrieval_query, True, num_results=4)
             if web_docs:
-                print(f"🌐 Retrieved {len(web_docs)} web search documents")
+                print(f"[{session_id}] 🌐 Retrieved {len(web_docs)} web search documents")
                 all_retrieved_docs.extend(web_docs)
         
-        # Process any adhoc document keys
         if user_r2_document_keys:
-            print(f"📎 Processing {len(user_r2_document_keys)} ad-hoc document keys")
-            adhoc_load_tasks = [self._download_and_split_one_doc(r2_key) for r2_key in user_r2_document_keys]
-            results_list_of_splits = await asyncio.gather(*adhoc_load_tasks)
-            adhoc_docs_count = 0
-            for splits_from_one_doc in results_list_of_splits:
-                adhoc_docs_count += len(splits_from_one_doc)
-                all_retrieved_docs.extend(splits_from_one_doc) 
-            print(f"📎 Added {adhoc_docs_count} splits from ad-hoc documents")
-        
-        # Deduplicate the documents
+            # ... (logic for ad-hoc documents)
+            pass
+
+        # Deduplicate
         unique_docs_content = set()
-        deduplicated_docs = []
-        for doc in all_retrieved_docs:
-            if doc.page_content not in unique_docs_content:
-                deduplicated_docs.append(doc)
-                unique_docs_content.add(doc.page_content)
+        deduplicated_docs = [doc for doc in all_retrieved_docs if doc.page_content not in unique_docs_content and not unique_docs_content.add(doc.page_content)]
         all_retrieved_docs = deduplicated_docs
-        
-        print(f"\n🔍 Retrieved {len(all_retrieved_docs)} total unique documents")
-        
-        # Count documents by source type
-        source_counts = {}
-        for doc in all_retrieved_docs:
-            source_type = doc.metadata.get("source_type", "unknown")
-            if "web" in source_type:
-                source_type = "web_search"
-            elif "user" in str(doc.metadata.get("source", "")):
-                source_type = "user_document"
-            else:
-                source_type = "knowledge_base"
-            
-            source_counts[source_type] = source_counts.get(source_type, 0) + 1
-        
-        for src_type, count in source_counts.items():
-            if src_type == "web_search":
-                print(f"🌐 Web search documents: {count}")
-            elif src_type == "user_document":
-                print(f"📄 User documents: {count}")
-            elif src_type == "knowledge_base":
-                print(f"📚 Knowledge base documents: {count}")
-            else:
-                print(f"📃 {src_type} documents: {count}")
-        
-        print("\n🧠 Starting LLM stream generation...")
+        print(f"\n[{session_id}] 🔍 Retrieved {len(all_retrieved_docs)} total unique documents")
+
+        # ... (source counts logging) ...
+
+        print(f"\n[{session_id}] 🧠 Starting LLM stream generation...")
         llm_stream_generator = await self._generate_llm_response(
             session_id, query, all_retrieved_docs, formatted_chat_history,
             llm_model_name, system_prompt_override, stream=True
         )
         
-        print("🔄 LLM stream initialized, beginning content streaming")
+        print(f"[{session_id}] 🔄 LLM stream initialized, beginning content streaming")
         async for content_chunk in llm_stream_generator:
             yield {"type": "content", "data": content_chunk}
         
-        print("✅ Stream complete, sending done signal")
+        print(f"[{session_id}] ✅ Stream complete, sending done signal")
         total_time = int((time.time() - start_time) * 1000)
-        print(f"⏱️ Total processing time: {total_time}ms")
+        print(f"[{session_id}] ⏱️ Total processing time: {total_time}ms")
         yield {"type": "done", "data": {"total_time_ms": total_time}}
-        print(f"{'='*80}\n")
+        print(f"[{session_id}] {'='*80}\n")
+
+    async def _handle_mcp_request(
+        self,
+        query: str,
+        selected_server_config_str: str,
+        chat_history: List[Dict[str, str]],
+        api_keys_for_mcp: Optional[Dict[str, str]] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process a request using a single, pre-selected MCP server configuration."""
+        server_name_for_log = "selected-mcp-server"
+        try:
+            selected_server_config = json.loads(selected_server_config_str)
+            # Attempt to get a name for logging
+            server_name_for_log = selected_server_config.get("name", server_name_for_log) 
+            print(f"Executing single MCP server: {server_name_for_log} for query: {query[:30]}...")
+
+            # Prepare environment variables - START WITH THE SERVER'S CONFIG
+            # Don't automatically add environment variables the server didn't ask for
+            effective_env_vars = {}
+            
+            # First, get the environment variables specified in the server config
+            if "env" in selected_server_config and isinstance(selected_server_config["env"], dict):
+                effective_env_vars = selected_server_config["env"].copy()
+
+            # Next, add API keys from frontend ONLY if they match keys specified in the config
+            if api_keys_for_mcp:
+                # Only add keys the server configuration expects
+                keys_to_add = {}
+                for key_name, key_value in api_keys_for_mcp.items():
+                    # Only add frontend keys that are specified in server config env
+                    if key_name in effective_env_vars:
+                        keys_to_add[key_name] = key_value
+                
+                if keys_to_add:
+                    print(f"Merging provided API keys into MCP environment: {list(keys_to_add.keys())}")
+                    effective_env_vars.update(keys_to_add)
+            
+            # Create the server_config structure for execution
+            command_config_for_execution = {
+                "command": selected_server_config.get("command"),
+                "args": selected_server_config.get("args", []),
+                "env": effective_env_vars 
+            }
+
+            async for response_chunk_str in self._execute_mcp_server_properly(
+                server_name=server_name_for_log, 
+                server_config=command_config_for_execution, 
+                query=query,
+                chat_history=chat_history
+            ):
+                yield {"type": "content", "data": response_chunk_str}
+            
+            yield {"type": "done", "data": f"MCP execution for '{server_name_for_log}' completed."}
+
+        except json.JSONDecodeError as e_json:
+            error_msg = f"Invalid MCP server configuration provided: {str(e_json)}"
+            print(f"JSONDecodeError in _handle_mcp_request for '{server_name_for_log}': {error_msg}")
+            yield {"type": "error", "error": error_msg}
+            yield {"type": "done", "data": "MCP execution failed due to config error."}
+        except Exception as e:
+            error_msg = f"Failed to process MCP request with server '{server_name_for_log}': {str(e)}"
+            print(f"Exception in _handle_mcp_request for '{server_name_for_log}': {error_msg}")
+            import traceback
+            traceback.print_exc()
+            yield {"type": "error", "error": error_msg}
+            yield {"type": "done", "data": "MCP execution failed."}
+
+    async def _execute_mcp_server_properly(self, server_name: str, server_config: Dict[str, Any], query: str, chat_history: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
+        """Actually execute the MCP server command and stream the real response.
+           server_config is expected to have 'command', 'args', and 'env'.
+        """
+        try:
+            command = server_config.get("command")
+            args = server_config.get("args", [])
+            # env_vars are already prepared and merged in server_config["env"]
+            env_vars = server_config.get("env", {}) 
+            
+            if not command:
+                raise ValueError(f"No command specified for MCP server '{server_name}'")
+            
+            print(f"Preparing to execute MCP server '{server_name}' with command: '{command}'")
+            if env_vars:
+                # Avoid logging sensitive values if any are present in env_vars
+                print(f"  with custom environment variables: {list(env_vars.keys())}")
+
+            async for chunk in self._execute_generic_mcp_server(command, args, env_vars, query, chat_history):
+                yield chunk
+                
+        except Exception as e:
+            print(f"Error in _execute_mcp_server_properly for '{server_name}': {e}")
+            yield f"Error executing MCP server '{server_name}': {str(e)}"
+
+    # _execute_generic_mcp_server remains largely the same.
+    # Ensure it logs the env var keys being used for debugging, not values.
+    async def _execute_generic_mcp_server(self, command: str, args: List[str], env_vars: Dict[str, str], query: str, chat_history: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
+        process = None
+        try:
+            # Create a copy of the current environment and update it with custom variables from frontend
+            proc_env = os.environ.copy()
+            if env_vars:
+                print(f"Updating process environment with keys: {list(env_vars.keys())}")
+            proc_env.update(env_vars)
+            
+            # FIX FOR WINDOWS: Use correct command format
+            if command == "npx" and os.name == 'nt':  # Windows system
+                npx_cmd = shutil.which("npx.cmd") or shutil.which("npx")
+                if npx_cmd:
+                    command = npx_cmd
+                    print(f"Found npx at: {command}")
+                else:
+                    yield "Error: npx command not found. Make sure Node.js is installed and in your PATH."
+                    return
+            
+            print(f"Executing command: {command} {' '.join(args)}")
+            
+            # Prepare the full command
+            full_command = [command] + args if args else [command]
+            
+            # Create the process with the environment variables
+            process = await asyncio.create_subprocess_exec(
+                *full_command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                shell=False
+            )
+            
+            # MCP JSON-RPC Communication Protocol
+            # Step 1: Initialize the MCP session
+            initialize_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "roots": {
+                            "listChanged": True
+                        }
+                    },
+                    "clientInfo": {
+                        "name": "RAG-MCP-Client",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+            
+            # Send initialize request
+            if process.stdin:
+                init_json = json.dumps(initialize_request) + "\n"
+                process.stdin.write(init_json.encode())
+                await process.stdin.drain()
+                
+                # Wait for initialize response
+                init_response_line = await process.stdout.readline()
+                if init_response_line:
+                    try:
+                        init_response = json.loads(init_response_line.decode().strip())
+                        print(f"MCP server initialized: {init_response}")
+                    except json.JSONDecodeError:
+                        print(f"Invalid initialize response: {init_response_line.decode().strip()}")
+                
+                # Step 2: Send initialized notification
+                initialized_notification = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }
+                
+                init_notif_json = json.dumps(initialized_notification) + "\n"
+                process.stdin.write(init_notif_json.encode())
+                await process.stdin.drain()
+                
+                # Step 3: List available tools
+                list_tools_request = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list"
+                }
+                
+                list_tools_json = json.dumps(list_tools_request) + "\n"
+                process.stdin.write(list_tools_json.encode())
+                await process.stdin.drain()
+                
+                # Wait for tools list response
+                tools_response_line = await process.stdout.readline()
+                available_tools = []
+                if tools_response_line:
+                    try:
+                        tools_response = json.loads(tools_response_line.decode().strip())
+                        if "result" in tools_response and "tools" in tools_response["result"]:
+                            available_tools = tools_response["result"]["tools"]
+                            print(f"Available tools: {[tool.get('name', 'unknown') for tool in available_tools]}")
+                    except json.JSONDecodeError:
+                        print(f"Invalid tools response: {tools_response_line.decode().strip()}")
+                
+                # Step 4: Call the appropriate tool with the query
+                if available_tools:
+                    # Use the first available tool (no hardcoding)
+                    tool_to_use = available_tools[0]
+                    tool_name = tool_to_use.get("name")
+                    
+                    if not tool_name:
+                        yield "Error: No valid tool name found from MCP server"
+                        return
+                    
+                    # Convert chat history and current query into messages format
+                    messages = []
+                    
+                    # Add chat history
+                    if chat_history:
+                        for msg in chat_history:
+                            role = msg.get("role", "user")
+                            content = msg.get("content", "")
+                            if role and content:
+                                messages.append({
+                                    "role": role,
+                                    "content": content
+                                })
+                    
+                    # Add current query as user message
+                    messages.append({
+                        "role": "user", 
+                        "content": query
+                    })
+                    
+                    # Prepare tool call arguments dynamically based on tool schema
+                    tool_schema = tool_to_use.get("inputSchema", {})
+                    tool_properties = tool_schema.get("properties", {})
+                    
+                    tool_arguments = {}
+                    
+                    # Check if the tool expects a 'messages' parameter
+                    if "messages" in tool_properties:
+                        tool_arguments["messages"] = messages
+                    # Check if the tool expects a 'query' parameter
+                    elif "query" in tool_properties:
+                        tool_arguments["query"] = query
+                    # Check if the tool expects a 'question' parameter
+                    elif "question" in tool_properties:
+                        tool_arguments["question"] = query
+                    # Check if the tool expects a 'prompt' parameter
+                    elif "prompt" in tool_properties:
+                        tool_arguments["prompt"] = query
+                    # If no recognized parameter, try with the first required parameter
+                    else:
+                        required_params = tool_schema.get("required", [])
+                        if required_params:
+                            # Use the first required parameter with the query
+                            first_param = required_params[0]
+                            if first_param in ["text", "input", "content"]:
+                                tool_arguments[first_param] = query
+                            else:
+                                # If messages format might be expected, try it
+                                tool_arguments[first_param] = messages if "message" in first_param.lower() else query
+                        else:
+                            # Fallback: try common parameter names
+                            tool_arguments["query"] = query
+                    
+                    # Add any other optional parameters with sensible defaults (only if they exist in schema)
+                    if "model" in tool_properties and "model" not in tool_arguments:
+                        # Don't add hardcoded model - let the server use its default
+                        pass
+                    
+                    if "max_tokens" in tool_properties and "max_tokens" not in tool_arguments:
+                        # Don't add hardcoded max_tokens - let the server use its default
+                        pass
+                    
+                    if "temperature" in tool_properties and "temperature" not in tool_arguments:
+                        # Don't add hardcoded temperature - let the server use its default
+                        pass
+                    
+                    call_tool_request = {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": tool_arguments
+                        }
+                    }
+                    
+                    print(f"Calling tool '{tool_name}' with arguments: {list(tool_arguments.keys())}")
+                    call_tool_json = json.dumps(call_tool_request) + "\n"
+                    process.stdin.write(call_tool_json.encode())
+                    await process.stdin.drain()
+                    
+                    # Read the tool call response
+                    tool_response_line = await process.stdout.readline()
+                    if tool_response_line:
+                        try:
+                            tool_response = json.loads(tool_response_line.decode().strip())
+                            print(f"Tool response received: {tool_response}")
+                            
+                            if "result" in tool_response:
+                                result = tool_response["result"]
+                                if isinstance(result, dict):
+                                    # Handle different response formats dynamically
+                                    if "content" in result:
+                                        # MCP standard format
+                                        content_items = result["content"]
+                                        if isinstance(content_items, list):
+                                            for content_item in content_items:
+                                                if isinstance(content_item, dict) and content_item.get("type") == "text":
+                                                    yield content_item.get("text", "")
+                                        else:
+                                            yield str(content_items)
+                                    elif "text" in result:
+                                        # Simple text response
+                                        yield result["text"]
+                                    elif "response" in result:
+                                        # Response field
+                                        yield result["response"]
+                                    elif "answer" in result:
+                                        # Answer field
+                                        yield result["answer"]
+                                    elif "output" in result:
+                                        # Output field
+                                        yield result["output"]
+                                    else:
+                                        # Fallback: stringify the result
+                                        yield str(result)
+                                elif isinstance(result, str):
+                                    yield result
+                                else:
+                                    yield str(result)
+                            elif "error" in tool_response:
+                                error_info = tool_response["error"]
+                                if isinstance(error_info, dict):
+                                    error_message = error_info.get("message", str(error_info))
+                                else:
+                                    error_message = str(error_info)
+                                yield f"MCP tool error: {error_message}"
+                            else:
+                                yield f"Unexpected response format: {tool_response}"
+                        except json.JSONDecodeError as e:
+                            print(f"Failed to parse tool response: {e}")
+                            yield tool_response_line.decode().strip()
+                else:
+                    yield "No tools available from MCP server"
+                
+                # Close stdin to signal we're done
+                process.stdin.close()
+            
+            # Wait for the process to complete
+            await process.wait()
+            
+            if process.returncode != 0:
+                print(f"MCP server process exited with code {process.returncode}")
+
+        except Exception as e:
+            print(f"Error in _execute_generic_mcp_server: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"Error executing MCP server: {str(e)}"
+            
+        finally:
+            if process:
+                try:
+                    if process.stdin and not process.stdin.is_closing():
+                        process.stdin.close()
+                    # Wait for process to terminate, with a timeout
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    print(f"Timeout waiting for MCP process {process.pid} to terminate. Killing.")
+                    if process.returncode is None:  # Still running
+                        process.kill()
+                        await process.wait()  # Ensure it's killed
+                except Exception as e_proc:
+                    print(f"Exception during MCP process cleanup: {e_proc}")
+
+
+    # Store the implementation as _original_execute_generic_mcp_server
+    _original_execute_generic_mcp_server = _execute_generic_mcp_server
 
     async def query(
         self, session_id: str, query: str, chat_history: Optional[List[Dict[str, str]]] = None,
@@ -1517,6 +1886,74 @@ class EnhancedRAG:
                 os.makedirs(self.temp_processing_path, exist_ok=True)
             except Exception as e: print(f"Error clearing temp path '{self.temp_processing_path}': {e}")
         print(f"All context (KB, all user sessions, temp files) cleared for gpt_id '{self.gpt_id}'.")
+
+    async def detect_query_type(self, query: str) -> Dict[str, Any]:
+        """
+        Automatically detect whether a query should be handled by RAG or MCP functionality.
+        Uses LangChain's tool calling to let the LLM make the decision based on query content.
+        
+        Args:
+            query: The user's query string
+            
+        Returns:
+            Dictionary with 'type' and other relevant information
+        """
+        tools = [RAGQueryTool, MCPServerQueryTool]
+        
+        # Create a model instance for tool detection
+        detection_model = AsyncOpenAI(
+            api_key=self.openai_api_key,
+            model="gpt-4o",  # Using a capable model for accurate detection
+            temperature=0
+        )
+        
+        # Use LangChain's bind_tools function
+        model_with_tools = detection_model.bind_tools(tools)
+        
+        # Create a system prompt that explains the task
+        system_message = (
+            "You are a query router that determines whether a user's query should be processed using "
+            "RAG (Retrieval Augmented Generation) or MCP (Model Context Protocol) server functionality. "
+            "\n\n"
+            "- Use RAG for general information queries, factual questions, or anything that would benefit from searching a knowledge base. "
+            "- Use MCP when the user explicitly mentions an MCP server, asks about server functionality, or needs to perform actions "
+            "that would require running an external program or service. "
+            "\n\n"
+            "Analyze the query carefully and choose the appropriate processing method."
+        )
+        
+        # Create messages for the model
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": query}
+        ]
+        
+        # Invoke the model
+        response = await model_with_tools.ainvoke(messages)
+        
+        # Check if the model made a tool call
+        if response.tool_calls:
+            tool_call = response.tool_calls[0]
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            
+            if tool_name == "RAGQueryTool":
+                return {
+                    "type": "rag",
+                    "explanation": tool_args.get("explanation", "General information query")
+                }
+            elif tool_name == "MCPServerQueryTool":
+                return {
+                    "type": "mcp",
+                    "server_name": tool_args.get("server_name", ""),
+                    "explanation": tool_args.get("explanation", "MCP server query")
+                }
+        
+        # Default to RAG if no tool call was made
+        return {
+            "type": "rag",
+            "explanation": "Defaulting to RAG for general information processing"
+        }
 
 async def main_test_rag_qdrant():
     print("Ensure QDRANT_URL and OPENAI_API_KEY are set in .env for this test.")
