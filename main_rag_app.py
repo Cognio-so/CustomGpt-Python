@@ -415,6 +415,13 @@ async def chat_stream(request: ChatStreamRequest):
         
         print(f"Chat stream request from {request.user_email} for GPT {request.gpt_id}")
         print(f"MCP enabled: {request.mcp_enabled}")
+        print(f"Web search enabled: {request.web_search_enabled}")
+        
+        # Determine if this is a new chat (add this)
+        is_new_chat = not request.history and not request.memory
+        if is_new_chat:
+            print(f"Starting new chat for session {session_id}")
+        
         if request.mcp_enabled and request.mcp_schema:
             try:
                 mcp_config = json.loads(request.mcp_schema)
@@ -436,16 +443,17 @@ async def chat_stream(request: ChatStreamRequest):
                 query=request.message,
                 chat_history=request.history,
                 user_r2_document_keys=request.user_document_keys,
-                use_hybrid_search=request.use_hybrid_search,
+                use_hybrid_search=True,  # Always enable hybrid search
                 llm_model_name=request.model,
                 system_prompt_override=request.system_prompt,
                 enable_web_search=request.web_search_enabled,
                 mcp_enabled=request.mcp_enabled,
                 mcp_schema=request.mcp_schema,
-                api_keys=request.api_keys
+                api_keys=request.api_keys,
+                is_new_chat=is_new_chat  # Pass the new parameter
             ):
                 if chunk["type"] == "error":
-                    yield f"data: {json.dumps({'error': chunk['text']})}\n\n"
+                    yield f"data: {json.dumps({'error': chunk.get('text', chunk.get('error', 'Unknown error'))})}\n\n"
                 else:
                     yield f"data: {json.dumps(chunk)}\n\n"
 

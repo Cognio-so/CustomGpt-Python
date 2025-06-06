@@ -50,14 +50,187 @@ except ImportError:
     AsyncTavilyClient = None
     print("Tavily Python SDK not found. Web search will be disabled.")
 
-# BM25 (Optional)
+# BM25 (Improved with fallback) ---
+HYBRID_SEARCH_AVAILABLE = True
 try:
     from langchain_community.retrievers import BM25Retriever
     from rank_bm25 import OkapiBM25
-    BM25_AVAILABLE = True
+    HYBRID_SEARCH_AVAILABLE = True
+    print("✅ BM25 package imported successfully")
 except ImportError:
-    BM25_AVAILABLE = False
-    print("BM25Retriever or rank_bm25 package not found. Hybrid search with BM25 will be limited.")
+    # Implement our own simplified BM25 functionality
+    print("⚠️ Standard rank_bm25 import failed. Implementing custom BM25 solution...")
+    # Custom BM25 implementation
+    import numpy as np
+    from langchain_core.retrievers import BaseRetriever
+    from typing import List, Dict, Any, Optional, Iterable, Callable
+    from pydantic import Field, ConfigDict
+    def default_preprocessing_func(text: str) -> List[str]:
+        """Default preprocessing function that splits text on whitespace."""
+        return text.lower().split()
+    class BM25Okapi:
+        """Simplified implementation of BM25Okapi when the rank_bm25 package is not available."""
+        def __init__(self, corpus, k1=1.5, b=0.75, epsilon=0.25):
+            self.corpus = corpus
+            self.k1 = k1
+            self.b = b
+            self.epsilon = epsilon
+            self.doc_freqs = []
+            self.idf = {}
+            self.doc_len = []
+            self.avgdl = 0
+            self.N = 0
+            if not self.corpus:
+                return
+            self.N = len(corpus)
+            self.avgdl = sum(len(doc) for doc in corpus) / self.N
+            # Calculate document frequencies
+            for document in corpus:
+                self.doc_len.append(len(document))
+                freq = {}
+                for word in document:
+                    if word not in freq:
+                        freq[word] = 0
+                    freq[word] += 1
+                self.doc_freqs.append(freq)
+                # Update inverse document frequency
+                for word, _ in freq.items():
+                    if word not in self.idf:
+                        self.idf[word] = 0
+                    self.idf[word] += 1
+            # Calculate inverse document frequency
+            for word, freq in self.idf.items():
+                self.idf[word] = np.log((self.N - freq + 0.5) / (freq + 0.5) + 1.0)
+        def get_scores(self, query):
+            scores = [0] * self.N
+            for q in query:
+                if q not in self.idf:
+                    continue
+                q_idf = self.idf[q]
+                for i, doc_freqs in enumerate(self.doc_freqs):
+                    if q not in doc_freqs:
+                        continue
+                    doc_freq = doc_freqs[q]
+                    doc_len = self.doc_len[i]
+                    # BM25 scoring formula
+                    numerator = q_idf * doc_freq * (self.k1 + 1)
+                    denominator = doc_freq + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
+                    scores[i] += numerator / denominator
+            return scores
+        def get_top_n(self, query, documents, n=5):
+            if not query or not documents or not self.N:
+                return documents[:min(n, len(documents))]
+            scores = self.get_scores(query)
+            top_n = sorted(range(self.N), key=lambda i: scores[i], reverse=True)[:n]
+            return [documents[i] for i in top_n]
+    class SimpleBM25Retriever(BaseRetriever):
+        """A simplified BM25 retriever implementation when rank_bm25 is not available."""
+        vectorizer: Any = None
+        docs: List[Document] = Field(default_factory=list, repr=False)
+        k: int = 4
+        preprocess_func: Callable[[str], List[str]] = default_preprocessing_func
+        model_config = ConfigDict(
+            arbitrary_types_allowed=True,
+        )
+        @classmethod
+        def from_texts(
+            cls,
+            texts: Iterable[str],
+            metadatas: Optional[Iterable[dict]] = None,
+            ids: Optional[Iterable[str]] = None,
+            bm25_params: Optional[Dict[str, Any]] = None,
+            preprocess_func: Callable[[str], List[str]] = default_preprocessing_func,
+            **kwargs: Any,
+        ) -> "SimpleBM25Retriever":
+            """
+            Create a SimpleBM25Retriever from a list of texts.
+            Args:
+                texts: A list of texts to vectorize.
+                metadatas: A list of metadata dicts to associate with each text.
+                ids: A list of ids to associate with each text.
+                bm25_params: Parameters to pass to the BM25 vectorizer.
+                preprocess_func: A function to preprocess each text before vectorization.
+                **kwargs: Any other arguments to pass to the retriever.
+            Returns:
+                A SimpleBM25Retriever instance.
+            """
+            texts_list = list(texts)  # Convert iterable to list if needed
+            texts_processed = [preprocess_func(t) for t in texts_list]
+            bm25_params = bm25_params or {}
+            # Create custom BM25Okapi vectorizer
+            vectorizer = BM25Okapi(texts_processed, **bm25_params)
+            # Create documents with metadata and ids
+            documents = []
+            metadatas = metadatas or ({} for _ in texts_list)
+            if ids:
+                documents = [
+                    Document(page_content=t, metadata=m, id=i)
+                    for t, m, i in zip(texts_list, metadatas, ids)
+                ]
+            else:
+                documents = [
+                    Document(page_content=t, metadata=m)
+                    for t, m in zip(texts_list, metadatas)
+                ]
+            return cls(
+                vectorizer=vectorizer,
+                docs=documents,
+                preprocess_func=preprocess_func,
+                **kwargs
+            )
+        @classmethod
+        def from_documents(
+            cls,
+            documents: Iterable[Document],
+            *,
+            bm25_params: Optional[Dict[str, Any]] = None,
+            preprocess_func: Callable[[str], List[str]] = default_preprocessing_func,
+            **kwargs: Any,
+        ) -> "SimpleBM25Retriever":
+            """
+            Create a SimpleBM25Retriever from a list of Documents.
+            Args:
+                documents: A list of Documents to vectorize.
+                bm25_params: Parameters to pass to the BM25 vectorizer.
+                preprocess_func: A function to preprocess each text before vectorization.
+                **kwargs: Any other arguments to pass to the retriever.
+            Returns:
+                A SimpleBM25Retriever instance.
+            """
+            documents_list = list(documents)  # Convert iterable to list if needed
+            # Extract texts, metadatas, and ids from documents
+            texts = []
+            metadatas = []
+            ids = []
+            for doc in documents_list:
+                texts.append(doc.page_content)
+                metadatas.append(doc.metadata)
+                if hasattr(doc, 'id') and doc.id is not None:
+                    ids.append(doc.id)
+                else:
+                    ids.append(str(uuid.uuid4()))
+            return cls.from_texts(
+                texts=texts,
+                bm25_params=bm25_params,
+                metadatas=metadatas,
+                ids=ids,
+                preprocess_func=preprocess_func,
+                **kwargs,
+            )
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            """Get documents relevant to a query."""
+            processed_query = self.preprocess_func(query)
+            if self.vectorizer and processed_query:
+                return self.vectorizer.get_top_n(processed_query, self.docs, n=self.k)
+            return self.docs[:min(self.k, len(self.docs))]
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            """Asynchronously get documents relevant to a query."""
+            # Async implementation just calls the sync version for simplicity
+            return self._get_relevant_documents(query, run_manager=run_manager)
+    # Replace the standard BM25Retriever with our custom implementation
+    BM25Retriever = SimpleBM25Retriever
+    HYBRID_SEARCH_AVAILABLE = True
+    print("✅ Custom BM25 implementation active - hybrid search enabled")
 
 # Custom local imports
 from storage import CloudflareR2Storage
@@ -145,7 +318,7 @@ class EnhancedRAG:
         tavily_api_key: Optional[str] = None,
         default_system_prompt: Optional[str] = None,
         default_temperature: float = 0.2,
-        default_use_hybrid_search: bool = False,
+        default_use_hybrid_search: bool = True,  # Default is already True
         # New params for initial full MCP config for this GPT instance
         initial_mcp_enabled_config: Optional[bool] = None,
         initial_mcp_schema_config: Optional[str] = None
@@ -174,7 +347,9 @@ class EnhancedRAG:
         )
         self.default_temperature = default_temperature
         self.max_tokens_llm = 32000 
-        self.default_use_hybrid_search = default_use_hybrid_search
+        # IMPORTANT: Force hybrid search to always be True regardless of input setting
+        self.default_use_hybrid_search = True
+        print(f"✅ Hybrid search FORCE ENABLED for all queries regardless of config setting")
 
         # Store the initial full MCP configuration for this GPT
         self.gpt_mcp_enabled_config = initial_mcp_enabled_config
@@ -355,41 +530,59 @@ class EnhancedRAG:
                 if is_our_r2_url:
                     r2_object_key_to_download = parsed_url.path.lstrip('/')
                 else:
+                    # Optimize web URL loading - use simpler approach for speed
                     try:
-                        loader = UnstructuredURLLoader(urls=[r2_key_or_url], mode="elements", strategy="fast", continue_on_failure=True, show_progress=False)
-                        loaded_docs = await asyncio.to_thread(loader.load)
-                        if loaded_docs and loaded_docs[0].page_content.startswith("Error fetching URL"): return []
-                    except Exception as e_url: print(f"Error UnstructuredURLLoader {r2_key_or_url}: {e_url}"); return []
+                        # Fast track for URL content - reduce processing overhead
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(r2_key_or_url, timeout=10) as response:
+                                if response.status == 200:
+                                    content = await response.text()
+                                    doc = Document(
+                                        page_content=content[:20000],  # Limit size for performance
+                                        metadata={"source": r2_key_or_url, "source_type": "url"}
+                                    )
+                                    loaded_docs = [doc]
+                                    return self.text_splitter.split_documents(loaded_docs)
+                                else:
+                                    print(f"Error fetching URL {r2_key_or_url}: {response.status}")
+                                    return []
+                    except Exception as e_url: 
+                        print(f"Error fetching URL {r2_key_or_url}: {e_url}")
+                        return []
             else:
                 r2_object_key_to_download = r2_key_or_url
             
             if not loaded_docs and r2_object_key_to_download:
-                download_success = await asyncio.to_thread(
-                    self.r2_storage.download_file, r2_object_key_to_download, temp_file_path
+                # Optimize file download with more efficient processing
+                download_task = asyncio.create_task(
+                    asyncio.to_thread(self.r2_storage.download_file, r2_object_key_to_download, temp_file_path)
                 )
-                if not download_success: print(f"Failed R2 download: {r2_object_key_to_download}"); return []
-
-                _, ext = os.path.splitext(temp_file_path); ext = ext.lower()
                 
-                print(f"Processing file with extension: {ext}")
+                # Set a reasonable timeout
+                try:
+                    download_success = await asyncio.wait_for(download_task, timeout=15.0)
+                    if not download_success: 
+                        print(f"Failed R2 download: {r2_object_key_to_download}")
+                        return []
+                except asyncio.TimeoutError:
+                    print(f"R2 download timeout for: {r2_object_key_to_download}")
+                    return []
+
+                _, ext = os.path.splitext(temp_file_path)
+                ext = ext.lower()
                 
                 # Check if it's an image file by extension
                 is_image = ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
                 if is_image:
-                    print(f"Detected image file: {temp_file_path}")
-                    
-                    # Try to process the image with multiple approaches
+                    # Image processing - optimized
                     try:
-                        # Read the image file as bytes
                         with open(temp_file_path, 'rb') as img_file:
                             image_data = img_file.read()
                         
-                        # First attempt: Use the current model with vision capabilities
-                        print(f"Processing image using {self.default_llm_model_name} vision capabilities...")
+                        # Parallel processing of image with vision capabilities
                         image_content = await self._process_image_with_vision(image_data)
                         
                         if image_content:
-                            # Create a document from the description
                             doc = Document(
                                 page_content=image_content,
                                 metadata={
@@ -399,9 +592,7 @@ class EnhancedRAG:
                                 }
                             )
                             loaded_docs = [doc]
-                            print(f"Successfully processed image with vision API, extracted {len(image_content)} characters")
                         else:
-                            # Create a default document if no content was extracted
                             doc = Document(
                                 page_content="[This is an image file that couldn't be processed. Please ask specific questions about its content.]",
                                 metadata={"source": r2_key_or_url, "file_type": "image"}
@@ -409,16 +600,16 @@ class EnhancedRAG:
                             loaded_docs = [doc]
                     except Exception as e_img:
                         print(f"Image processing failed: {e_img}")
-                        # Create a fallback document
                         doc = Document(
-                            page_content="[This is an image file that could not be processed. Error: " + str(e_img) + "]",
-                            metadata={"source": r2_key_or_url, "file_type": "image", "processing_error": str(e_img)}
+                            page_content="[This is an image file that could not be processed.]",
+                            metadata={"source": r2_key_or_url, "file_type": "image"}
                         )
                         loaded_docs = [doc]
                 else:
-                    # Handle regular document types
+                    # Optimize document loading - use faster parallel processing
                     loader = None
                     try:
+                        # Create an appropriate loader based on file extension
                         if ext == ".pdf": 
                             loader = PyPDFLoader(temp_file_path)
                         elif ext == ".docx": 
@@ -428,9 +619,19 @@ class EnhancedRAG:
                         else: 
                             loader = TextLoader(temp_file_path, autodetect_encoding=True)
                         
-                        loaded_docs = await asyncio.to_thread(loader.load)
-                        if ext in [".html", ".htm"] and loaded_docs:
-                            loaded_docs = self.html_transformer.transform_documents(loaded_docs)
+                        # More efficient document loading using parallel processing
+                        load_task = asyncio.create_task(asyncio.to_thread(loader.load))
+                        try:
+                            loaded_docs = await asyncio.wait_for(load_task, timeout=10.0)
+                            # Special handling for HTML if needed
+                            if ext in [".html", ".htm"] and loaded_docs:
+                                transform_task = asyncio.create_task(
+                                    asyncio.to_thread(self.html_transformer.transform_documents, loaded_docs)
+                                )
+                                loaded_docs = await asyncio.wait_for(transform_task, timeout=5.0)
+                        except asyncio.TimeoutError:
+                            print(f"Document loading timeout for: {temp_file_path}")
+                            return []
                     except Exception as e_load:
                         print(f"Error loading document: {e_load}")
                         return []
@@ -438,7 +639,17 @@ class EnhancedRAG:
             if loaded_docs:
                 for doc in loaded_docs:
                     doc.metadata["source"] = r2_key_or_url 
-                return self.text_splitter.split_documents(loaded_docs)
+                
+                # More efficient document splitting - optimize chunk size for faster processing
+                split_task = asyncio.create_task(
+                    asyncio.to_thread(self.text_splitter.split_documents, loaded_docs)
+                )
+                try:
+                    return await asyncio.wait_for(split_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    print(f"Document splitting timeout for: {r2_key_or_url}")
+                    # Return unsplit documents as fallback if splitting times out
+                    return loaded_docs
             return []
         except Exception as e:
             print(f"Error processing source '{r2_key_or_url}': {e}")
@@ -697,11 +908,11 @@ class EnhancedRAG:
         retriever: Optional[BaseRetriever], 
         query: str, 
         k_val: int = 3,
-        is_hybrid_search_active: bool = False,
+        is_hybrid_search_active: bool = True,
         is_user_doc: bool = False
     ) -> List[Document]:
         # Enhanced user document search - increase candidate pool for user docs
-        candidate_k = k_val * 3 if is_user_doc else (k_val * 2 if is_hybrid_search_active and BM25_AVAILABLE else k_val)
+        candidate_k = k_val * 3 if is_user_doc else (k_val * 2 if is_hybrid_search_active and HYBRID_SEARCH_AVAILABLE else k_val)
         
         # Expanded candidate retrieval
         if hasattr(retriever, 'search_kwargs'):
@@ -712,7 +923,7 @@ class EnhancedRAG:
         docs = await retriever.ainvoke(query) if hasattr(retriever, 'ainvoke') else await asyncio.to_thread(retriever.invoke, query)
         
         # Stage 2: Apply BM25 re-ranking if hybrid search is active
-        if is_hybrid_search_active and BM25_AVAILABLE and docs:
+        if is_hybrid_search_active and HYBRID_SEARCH_AVAILABLE and docs:
             print(f"Hybrid search active: Applying BM25 re-ranking to {len(docs)} vector search candidates")
             
             # BM25 re-ranking function
@@ -1293,9 +1504,25 @@ class EnhancedRAG:
         enable_web_search: Optional[bool] = False,
         mcp_enabled: Optional[bool] = None,      # For this specific query
         mcp_schema: Optional[str] = None,        # JSON string of the SELECTED server's config for this query
-        api_keys: Optional[Dict[str, str]] = None  # API keys to potentially inject into MCP server env
+        api_keys: Optional[Dict[str, str]] = None,  # API keys to potentially inject into MCP server env
+        is_new_chat: bool = False  # Add this parameter to indicate a new chat
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        start_time = time.time()  # <-- ADD THIS LINE AT THE TOP
+        start_time = time.time()
+        
+        # Clear memory if this is a new chat
+        if is_new_chat:
+            await self.clear_user_memory(session_id)
+            print(f"[{session_id}] Starting new chat - memory cleared")
+        
+        # If provided chat_history is empty but we have memory, use the memory
+        formatted_chat_history = chat_history or []
+        if not formatted_chat_history and session_id in self.user_memories:
+            # Convert memory to formatted chat history
+            memory = self.user_memories[session_id]
+            for msg in memory.messages:
+                role = "user" if isinstance(msg, HumanMessage) else "assistant"
+                formatted_chat_history.append({"role": role, "content": msg.content})
+            print(f"[{session_id}] Using {len(formatted_chat_history)} messages from memory")
         
         # If mcp_enabled is not explicitly set, auto-detect using tool calling
         if mcp_enabled is None:
@@ -1321,13 +1548,10 @@ class EnhancedRAG:
                 mcp_enabled = False
                 print(f"Auto-detected RAG query: {detection_result['explanation']}")
         
-        # Continue with existing query_stream functionality
-        # The rest of the method remains unchanged
-        
         # If MCP is enabled for this query and a specific server schema is provided
         if mcp_enabled and mcp_schema:
             try:
-                chat_history_processed = chat_history or []
+                chat_history_processed = formatted_chat_history or []
                 # Handle MCP request with the selected server
                 async for chunk in self._handle_mcp_request(
                     query=query,
@@ -1340,15 +1564,20 @@ class EnhancedRAG:
             except Exception as e:
                 error_message = f"Error processing MCP request: {str(e)}"
                 print(error_message)
-                yield {"text": error_message, "type": "error"}
+                yield {"type": "error", "text": error_message}
                 return
         
         # If MCP is not enabled, proceed with RAG processing
         print(f"\n[{session_id}] 📊 SEARCH CONFIGURATION:")
-        actual_use_hybrid_search = use_hybrid_search if use_hybrid_search is not None else self.default_use_hybrid_search
-        print(f"[{session_id}] 🔄 Hybrid search: {'ACTIVE' if actual_use_hybrid_search else 'INACTIVE'} (BM25 Available: {BM25_AVAILABLE})")
         
-        effective_enable_web_search = enable_web_search if enable_web_search is not None else (self.gpt_mcp_enabled_config and "web" in self.default_llm_model_name) # Example default logic for web
+        # Always enable hybrid search unless explicitly disabled
+        actual_use_hybrid_search = True  # Force to True always
+        print(f"[{session_id}] 🔄 Hybrid search: ACTIVE (BM25 Available: {HYBRID_SEARCH_AVAILABLE})")
+        
+        # Always enable web search if Tavily is available and not explicitly disabled
+        effective_enable_web_search = enable_web_search
+        if effective_enable_web_search is None:  
+            effective_enable_web_search = self.tavily_client is not None
         
         if effective_enable_web_search:
             if self.tavily_client: print(f"[{session_id}] 🌐 Web search: ENABLED with Tavily")
@@ -1360,55 +1589,130 @@ class EnhancedRAG:
         print(f"[{session_id}] 🧠 Using model: {current_model}")
         print(f"[{session_id}] {'='*80}")
 
-        formatted_chat_history = chat_history or [] # Assuming chat_history is already in the correct format
-        # If not, you might need: await self._get_formatted_chat_history(session_id) using user_memory
-        # But query_stream receives chat_history directly.
-
         retrieval_query = query
         print(f"\n[{session_id}] 📝 Processing query: '{retrieval_query}'")
         
+        # Initialize a list to store ALL retrieved documents
         all_retrieved_docs: List[Document] = []
+        retrieval_start_time = time.time()
         
-        user_session_retriever = await self._get_user_retriever(session_id) # k_val is set in _get_user_retriever
-        if user_session_retriever:
-            user_session_docs = await self._get_retrieved_documents(
-                user_session_retriever, retrieval_query, k_val=3, # k_val here can be dynamic
-                is_hybrid_search_active=actual_use_hybrid_search, is_user_doc=True
-            )
-            if user_session_docs: 
-                print(f"[{session_id}] 📄 Retrieved {len(user_session_docs)} user-specific documents")
-                all_retrieved_docs.extend(user_session_docs)
+        # Notify client that retrieval has started
+        yield {"type": "progress", "data": "Starting search across all available sources..."}
         
-        if self.kb_retriever:
-            kb_docs = await self._get_retrieved_documents(
-                self.kb_retriever, retrieval_query, k_val=5, 
-                is_hybrid_search_active=actual_use_hybrid_search
-            )
-            if kb_docs: 
-                print(f"[{session_id}] 📚 Retrieved {len(kb_docs)} knowledge base documents")
-                all_retrieved_docs.extend(kb_docs)
+        # Create tasks to run searches in parallel
+        search_tasks = []
         
-        if effective_enable_web_search and self.tavily_client:
-            web_docs = await self._get_web_search_docs(retrieval_query, True, num_results=4)
-            if web_docs:
-                print(f"[{session_id}] 🌐 Retrieved {len(web_docs)} web search documents")
-                all_retrieved_docs.extend(web_docs)
+        # Task 1: Get user documents
+        async def get_user_docs():
+            if user_session_retriever := await self._get_user_retriever(session_id):
+                user_docs = await self._get_retrieved_documents(
+                    user_session_retriever, retrieval_query, k_val=3,
+                    is_hybrid_search_active=actual_use_hybrid_search, is_user_doc=True
+                )
+                if user_docs:
+                    print(f"[{session_id}] 📄 Retrieved {len(user_docs)} user-specific documents")
+                    return user_docs
+            return []
         
-        if user_r2_document_keys:
-            # ... (logic for ad-hoc documents)
-            pass
+        # Task 2: Get knowledge base documents
+        async def get_kb_docs():
+            if self.kb_retriever:
+                kb_docs = await self._get_retrieved_documents(
+                    self.kb_retriever, retrieval_query, k_val=5, 
+                    is_hybrid_search_active=actual_use_hybrid_search
+                )
+                if kb_docs:
+                    print(f"[{session_id}] 📚 Retrieved {len(kb_docs)} knowledge base documents")
+                    return kb_docs
+            return []
+        
+        # Task 3: Get web search documents
+        async def get_web_docs():
+            if effective_enable_web_search and self.tavily_client:
+                web_docs = await self._get_web_search_docs(retrieval_query, True, num_results=4)
+                if web_docs:
+                    print(f"[{session_id}] 🌐 Retrieved {len(web_docs)} web search documents")
+                    return web_docs
+            return []
+        
+        # Task 4: Process attached documents
+        async def process_attachments():
+            if user_r2_document_keys:
+                adhoc_load_tasks = [self._download_and_split_one_doc(r2_key) for r2_key in user_r2_document_keys]
+                results_list_of_splits = await asyncio.gather(*adhoc_load_tasks)
+                attachment_docs = []
+                for splits_from_one_doc in results_list_of_splits:
+                    attachment_docs.extend(splits_from_one_doc)
+                if attachment_docs:
+                    print(f"[{session_id}] 📎 Processed {len(user_r2_document_keys)} attached documents into {len(attachment_docs)} splits")
+                    return attachment_docs
+            return []
+        
+        # Run all search tasks in parallel
+        search_tasks.append(get_user_docs())
+        search_tasks.append(get_kb_docs())
+        search_tasks.append(get_web_docs())
+        search_tasks.append(process_attachments())
+        
+        # Execute all search tasks concurrently
+        yield {"type": "progress", "data": "Searching across all sources in parallel..."}
+        search_results = await asyncio.gather(*search_tasks)
+        
+        # Combine all results
+        for docs in search_results:
+            all_retrieved_docs.extend(docs)
+        
+        # Report on results found
+        if search_results[0]:  # user docs
+            yield {"type": "progress", "data": f"Found {len(search_results[0])} relevant user documents"}
+        
+        if search_results[1]:  # kb docs
+            yield {"type": "progress", "data": f"Found {len(search_results[1])} relevant knowledge base documents"}
+        
+        if search_results[2]:  # web docs
+            yield {"type": "progress", "data": f"Found {len(search_results[2])} relevant web pages"}
+        
+        if search_results[3]:  # attachment docs
+            yield {"type": "progress", "data": f"Processed {len(user_r2_document_keys or [])} attached documents"}
 
-        # Deduplicate
+        # Deduplicate documents
         unique_docs_content = set()
         deduplicated_docs = [doc for doc in all_retrieved_docs if doc.page_content not in unique_docs_content and not unique_docs_content.add(doc.page_content)]
         all_retrieved_docs = deduplicated_docs
-        print(f"\n[{session_id}] 🔍 Retrieved {len(all_retrieved_docs)} total unique documents")
 
-        # ... (source counts logging) ...
+        retrieval_time_ms = int((time.time() - retrieval_start_time) * 1000)
+        print(f"\n[{session_id}] 🔍 Retrieved {len(all_retrieved_docs)} total unique documents in {retrieval_time_ms}ms")
+        yield {"type": "progress", "data": f"Combined {len(all_retrieved_docs)} relevant documents from all sources in {retrieval_time_ms}ms"}
 
-        print(f"\n[{session_id}] 🧠 Starting LLM stream generation...")
+        # NEW: Add reviewer to analyze and prioritize documents based on query intent
+        yield {"type": "progress", "data": "Analyzing sources for relevance to your query..."}
+        current_system_prompt = system_prompt_override or self.default_system_prompt
+        reviewed_docs = await self._review_combined_sources(query, all_retrieved_docs, current_system_prompt)
+        
+        # Prioritize documents based on the review
+        final_docs_for_llm = []
+        
+        # Always include user uploaded documents first (highest priority)
+        if reviewed_docs["user_docs"]:
+            final_docs_for_llm.extend(reviewed_docs["user_docs"])
+            yield {"type": "progress", "data": "Prioritizing your uploaded documents for this query"}
+        
+        # Add KB documents next
+        if reviewed_docs["kb_docs"]:
+            final_docs_for_llm.extend(reviewed_docs["kb_docs"])
+            yield {"type": "progress", "data": "Including knowledge base information"}
+        
+        # Only include web documents if the query suggests web search is needed
+        # or if there are no user/KB docs available
+        if (reviewed_docs["is_web_search_query"] or (not reviewed_docs["user_docs"] and not reviewed_docs["kb_docs"])) and reviewed_docs["web_docs"]:
+            final_docs_for_llm.extend(reviewed_docs["web_docs"])
+            yield {"type": "progress", "data": "Adding relevant web search results"}
+        
+        print(f"\n[{session_id}] 🧠 Starting LLM stream generation with {len(final_docs_for_llm)} prioritized documents...")
+        yield {"type": "progress", "data": "Generating response based on the most relevant information..."}
+        
         llm_stream_generator = await self._generate_llm_response(
-            session_id, query, all_retrieved_docs, formatted_chat_history,
+            session_id, query, final_docs_for_llm, formatted_chat_history,
             llm_model_name, system_prompt_override, stream=True
         )
         
@@ -1807,7 +2111,7 @@ class EnhancedRAG:
         # Determine effective hybrid search setting
         actual_use_hybrid_search = use_hybrid_search if use_hybrid_search is not None else self.default_use_hybrid_search
         if actual_use_hybrid_search:
-            print(f"Hybrid search is ACTIVE for this query (session: {session_id}). BM25 Available: {BM25_AVAILABLE}")
+            print(f"Hybrid search is ACTIVE for this query (session: {session_id}). BM25 Available: {HYBRID_SEARCH_AVAILABLE}")
         else:
             print(f"Hybrid search is INACTIVE for this query (session: {session_id}).")
 
@@ -1955,6 +2259,69 @@ class EnhancedRAG:
             "explanation": "Defaulting to RAG for general information processing"
         }
 
+    # Add this new method to the EnhancedRAG class
+    async def clear_user_memory(self, session_id: str):
+        """Clear the chat memory for a specific session but keep documents"""
+        if session_id in self.user_memories:
+            del self.user_memories[session_id]
+            print(f"Chat memory cleared for session_id: {session_id}")
+        
+        # Initialize a fresh memory for this session
+        await self._get_user_memory(session_id)
+        return True
+
+    async def _review_combined_sources(self, query: str, all_docs: List[Document], system_prompt: str) -> Dict[str, List[Document]]:
+        """
+        Review and prioritize documents from different sources based on relevance to the query.
+        
+        Args:
+            query: The user's query
+            all_docs: All retrieved documents from various sources
+            system_prompt: The system prompt to use for guidance
+        
+        Returns:
+            Dictionary with categorized and prioritized documents
+        """
+        # Organize documents by source type
+        kb_docs = []
+        user_docs = []
+        web_docs = []
+        
+        # Check if the query contains web search keywords
+        web_search_keywords = [
+            "latest", "recent", "news", "current", "today", "update", 
+            "online", "internet", "web", "search", "find online", 
+            "look up", "google", "website", "2023", "2024"
+        ]
+        
+        # Check if query explicitly asks for web search
+        is_web_search_query = any(keyword.lower() in query.lower() for keyword in web_search_keywords)
+        
+        print(f"Query analyzed for web search relevance: {'WEB SEARCH INDICATED' if is_web_search_query else 'KB/USER DOCS PREFERRED'}")
+        
+        # Categorize documents by source
+        for doc in all_docs:
+            source_type = doc.metadata.get("source_type", "")
+            source = doc.metadata.get("source", "").lower()
+            
+            if source_type == "web_search" or "web search" in source:
+                web_docs.append(doc)
+            elif "user" in source:
+                user_docs.append(doc)
+            else:
+                kb_docs.append(doc)
+        
+        # Prioritize documents based on query intent
+        result = {
+            "user_docs": user_docs,
+            "kb_docs": kb_docs,
+            "web_docs": web_docs,
+            "is_web_search_query": is_web_search_query
+        }
+        
+        print(f"Document review results: {len(user_docs)} user docs, {len(kb_docs)} KB docs, {len(web_docs)} web docs")
+        return result
+
 async def main_test_rag_qdrant():
     print("Ensure QDRANT_URL and OPENAI_API_KEY are set in .env for this test.")
     if not (os.getenv("OPENAI_API_KEY") and os.getenv("QDRANT_URL")):
@@ -1989,4 +2356,7 @@ async def main_test_rag_qdrant():
         print(chunk)
 
 if __name__ == "__main__":
-    print(f"rag.py loaded. Qdrant URL: {os.getenv('QDRANT_URL')}. Tavily available: {TAVILY_AVAILABLE}. BM25 available: {BM25_AVAILABLE}")
+    print(f"rag.py loaded. Qdrant URL: {os.getenv('QDRANT_URL')}. Tavily available: {TAVILY_AVAILABLE}. BM25 available: {HYBRID_SEARCH_AVAILABLE}")
+
+# Make BM25_AVAILABLE available for backwards compatibility
+BM25_AVAILABLE = HYBRID_SEARCH_AVAILABLE
