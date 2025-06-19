@@ -56,7 +56,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.mygpt.work", "https://mygpt.asset-7a1.workers.dev", "http://localhost:5173"],
+    allow_origins=["https://www.mygpt.work","https://mygpt.asset-7a1.workers.dev", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
