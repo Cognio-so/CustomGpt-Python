@@ -56,7 +56,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.mygpt.work", "http://localhost:5173"],
+    allow_origins=["https://www.mygpt.work", "https://mygpt.asset-7a1.workers.dev", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
@@ -401,7 +401,7 @@ async def upload_documents_endpoint(
         except Exception as e:
             print(f"BG Task: Error indexing {doc_type} documents for gpt_id '{g_id}': {e}")
 
-    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_email)
+    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_email, gpt_id)
 
     return JSONResponse(status_code=202, content={
         "message": f"{len(r2_keys_or_urls_for_indexing)} files accepted for {'user-specific' if is_user_doc_bool else 'knowledge base'} indexing. Processing in background.",

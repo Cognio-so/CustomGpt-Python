@@ -1116,6 +1116,10 @@ class EnhancedRAG:
                 async def openrouter_stream_generator():
                     full_response_content = ""
                     try:
+                        # Add this validation check
+                        if not self.openrouter_api_key or len(self.openrouter_api_key.strip()) < 10:
+                            yield "Error: Valid OpenRouter API key is required. Please check your API key configuration."
+                            return
                         response_stream = await self.openrouter_client.chat.completions.create(
                             model=current_llm_model, 
                             messages=messages, 
