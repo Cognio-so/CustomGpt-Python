@@ -56,7 +56,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.mygpt.work","https://nextjs-rho-nine-87.vercel.app","https://www.druidx.co" "http://localhost:5173"],
+    allow_origins=["https://www.mygpt.work","https://www.druidx.co"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
