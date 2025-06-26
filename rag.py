@@ -5,6 +5,7 @@ import time
 import json
 import base64
 import re
+import datetime  # Add datetime import at the top
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union
 from urllib.parse import urlparse
 import uuid
@@ -1072,20 +1073,34 @@ class EnhancedRAG:
         if not context_str.strip():
             context_str = "No relevant context could be found from any available source for this query. Please ensure documents are uploaded and relevant to your question."
 
-        # Prepare user message
+        # Add current date and time to the query
+        current_time = datetime.datetime.now()
+        formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Updated user query message with stronger emphasis on accuracy
         user_query_message_content = (
-            f"📚 **CONTEXT:**\n{context_str}\n\n"
-            f"Based on the above context and any relevant chat history, provide a detailed, well-structured response to this query:\n\n"
-            f"**QUERY:** {query}\n\n"
-            f"Requirements for your response:\n"
-            f"1. 🎯 Start with a relevant emoji and descriptive headline\n"
-            f"2. 📋 Organize with clear headings and subheadings\n"
-            f"3. 📊 Include bullet points or numbered lists where appropriate\n"
-            f"4. 💡 Highlight key insights or important information\n"
-            f"5. 📝 Reference specific information from the provided documents\n"
-            f"6. 🔍 Use appropriate emojis (about 1-2 per section) to make content engaging\n"
-            f"7. 📚 Make your response comprehensive, detailed and precise\n"
-        )
+    f"📚 **CONTEXT PROVIDED:**\n{context_str}\n\n"
+    f"🕒 **Current Date & Time:** {formatted_time}\n\n"
+    f"💬 **USER QUERY:** {query}\n\n"
+    f"🎯 **INSTRUCTIONS FOR YOUR RESPONSE:**\n"
+    f"Please craft a high-quality, helpful, and context-aware response. Follow these rules carefully:\n\n"
+
+    f"✅ **CONTENT GUIDELINES:**\n"
+    f"1. Use **only the information** available in the provided context.\n"
+    f"2. If the context lacks enough data to answer, say so clearly and avoid assumptions.\n"
+    f"3. If any general knowledge is used, label it as such (*e.g., “General Insight:”*).\n"
+    f"4. Always verify facts, figures, or names before referencing—do not hallucinate.\n"
+    f"5. If the query invites conversation, respond naturally and **engage the user** with thoughtful follow-ups.\n\n"
+
+    f"📌 **RESPONSE STRUCTURE:**\n"
+    f"- 🏷️ Start with a **relevant emoji and a short, compelling headline**\n"
+    f"- 📋 Use **headings and subheadings** to organize content\n"
+    f"- 📊 Include **bullets or numbered lists** for clarity\n"
+    f"- 💡 Emphasize **key takeaways** or highlights\n"
+    f"- 📑 Cite information **explicitly from the context** (e.g., *“As per Context…”*)\n"
+    f"- 😊 Use **1–2 emojis per section** to maintain an engaging tone\n"
+    f"- 🤝 If appropriate, **end with a friendly prompt or follow-up question** to keep the conversation flowing\n"
+)
 
         messages = [{"role": "system", "content": current_system_prompt}]
         messages.extend(chat_history_messages)
@@ -1136,8 +1151,11 @@ class EnhancedRAG:
                         print(f"OpenRouter streaming error: {e_stream}")
                         yield f"I apologize, but I couldn't process your request successfully with OpenRouter. Please try asking in a different way."
                     finally:
+                        # Store full human message but summarized AI message
                         await asyncio.to_thread(user_memory.add_user_message, query)
-                        await asyncio.to_thread(user_memory.add_ai_message, full_response_content)
+                        # Summarize the AI response before storing it
+                        summarized_response = await self._summarize_ai_message(full_response_content)
+                        await asyncio.to_thread(user_memory.add_ai_message, summarized_response)
                 return openrouter_stream_generator()
             else:
                 response_content = ""
@@ -1153,8 +1171,11 @@ class EnhancedRAG:
                     print(f"OpenRouter non-streaming error: {e_nostream}")
                     response_content = f"Error with OpenRouter: {str(e_nostream)}"
                 
+                # Store full human message but summarized AI message
                 await asyncio.to_thread(user_memory.add_user_message, query)
-                await asyncio.to_thread(user_memory.add_ai_message, response_content)
+                # Summarize the AI response before storing it
+                summarized_response = await self._summarize_ai_message(response_content)
+                await asyncio.to_thread(user_memory.add_ai_message, summarized_response)
                 return response_content
         
         # GPT-4o or GPT-4o-mini models (OpenAI)
@@ -1512,6 +1533,11 @@ class EnhancedRAG:
         is_new_chat: bool = False  # Add this parameter to indicate a new chat
     ) -> AsyncGenerator[Dict[str, Any], None]:
         start_time = time.time()
+        
+        # Add timestamp to session info
+        current_time = datetime.datetime.now()
+        formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{session_id}] Query at {formatted_time}: {query[:50]}{'...' if len(query) > 50 else ''}")
         
         # Clear memory if this is a new chat
         if is_new_chat:
@@ -2208,56 +2234,63 @@ class EnhancedRAG:
         """
         tools = [RAGQueryTool, MCPServerQueryTool]
         
-        # Create a model instance for tool detection
-        detection_model = AsyncOpenAI(
-            api_key=self.openai_api_key,
-            model="gpt-4o",  # Using a capable model for accurate detection
-            temperature=0
-        )
-        
-        # Use LangChain's bind_tools function
-        model_with_tools = detection_model.bind_tools(tools)
-        
-        # Create a system prompt that explains the task
-        system_message = (
-            "You are a query router that determines whether a user's query should be processed using "
-            "RAG (Retrieval Augmented Generation) or MCP (Model Context Protocol) server functionality. "
-            "\n\n"
-            "- Use RAG for general information queries, factual questions, or anything that would benefit from searching a knowledge base. "
-            "- Use MCP when the user explicitly mentions an MCP server, asks about server functionality, or needs to perform actions "
-            "that would require running an external program or service. "
-            "\n\n"
-            "Analyze the query carefully and choose the appropriate processing method."
-        )
-        
-        # Create messages for the model
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": query}
-        ]
-        
-        # Invoke the model
-        response = await model_with_tools.ainvoke(messages)
-        
-        # Check if the model made a tool call
-        if response.tool_calls:
-            tool_call = response.tool_calls[0]
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+        try:
+            # Create a model instance for tool detection - FIXED constructor parameters
+            detection_model = AsyncOpenAI(
+                api_key=self.openai_api_key,
+                timeout=10.0
+            )
             
-            if tool_name == "RAGQueryTool":
-                return {
-                    "type": "rag",
-                    "explanation": tool_args.get("explanation", "General information query")
-                }
-            elif tool_name == "MCPServerQueryTool":
-                return {
-                    "type": "mcp",
-                    "server_name": tool_args.get("server_name", ""),
-                    "explanation": tool_args.get("explanation", "MCP server query")
-                }
-        
-        # Default to RAG if no tool call was made
+            # Use LangChain's bind_tools function
+            model_with_tools = detection_model.bind(
+                model="gpt-4o",  # Specify model as an argument to bind() instead
+                temperature=0.0,
+                tools=tools
+            )
+            
+            # Create a system prompt that explains the task
+            system_message = (
+                "You are a query router that determines whether a user's query should be processed using "
+                "RAG (Retrieval Augmented Generation) or MCP (Model Context Protocol) server functionality. "
+                "\n\n"
+                "- Use RAG for general information queries, factual questions, or anything that would benefit from searching a knowledge base. "
+                "- Use MCP when the user explicitly mentions an MCP server, asks about server functionality, or needs to perform actions "
+                "that would require running an external program or service. "
+                "\n\n"
+                "Analyze the query carefully and choose the appropriate processing method."
+            )
+            
+            # Create messages for the model
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": query}
+            ]
+            
+            # Invoke the model
+            response = await model_with_tools.ainvoke(messages)
+            
+            # Check if the model made a tool call
+            if response.tool_calls:
+                tool_call = response.tool_calls[0]
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                if tool_name == "RAGQueryTool":
+                    return {
+                        "type": "rag",
+                        "explanation": tool_args.get("explanation", "General information query")
+                    }
+                elif tool_name == "MCPServerQueryTool":
+                    return {
+                        "type": "mcp",
+                        "server_name": tool_args.get("server_name", ""),
+                        "explanation": tool_args.get("explanation", "MCP server query")
+                    }
+        except Exception as e:
+            print(f"Error in detect_query_type: {e}")
+            # In case of any error, default to RAG
+            
+        # Default to RAG if no tool call was made or if there was an error
         return {
             "type": "rag",
             "explanation": "Defaulting to RAG for general information processing"
@@ -2325,6 +2358,55 @@ class EnhancedRAG:
         
         print(f"Document review results: {len(user_docs)} user docs, {len(kb_docs)} KB docs, {len(web_docs)} web docs")
         return result
+
+    # Add this new method to the EnhancedRAG class
+    async def _summarize_ai_message(self, full_response: str) -> str:
+        """Summarize the AI message to a shorter version for history storage"""
+        try:
+            # Limit the length for immediate summary without API call for very short responses
+            if len(full_response) < 150:
+                return full_response  # Return full response for short messages
+            
+            # Get the first and last paragraph
+            paragraphs = full_response.split('\n\n')
+            if len(paragraphs) <= 2:
+                return full_response[:150] + "..." if len(full_response) > 150 else full_response
+            
+            # For longer responses, use the LLM to generate a summary
+            if len(full_response) > 1000:
+                try:
+                    summary_prompt = (
+                        "Please summarize the following AI response in 2-3 sentences, "
+                        "focusing on the main points and conclusions:\n\n"
+                        f"{full_response[:2000]}{'...' if len(full_response) > 2000 else ''}"
+                    )
+                    
+                    messages = [
+                        {"role": "system", "content": "You are a helpful summarization assistant."},
+                        {"role": "user", "content": summary_prompt}
+                    ]
+                    
+                    response = await self.async_openai_client.chat.completions.create(
+                        model="gpt-3.5-turbo",  # Use a faster model for summarization
+                        messages=messages,
+                        temperature=0.3,
+                        max_tokens=150
+                    )
+                    
+                    summary = response.choices[0].message.content
+                    return f"[SUMMARY: {summary}]"
+                except Exception as e:
+                    print(f"Error in AI response summarization: {e}")
+                    # Fall back to simple truncation
+                    return f"{paragraphs[0]}\n\n[...]\n\n{paragraphs[-1]}"
+            
+            # Default to extracting first and last parts
+            return f"{paragraphs[0]}\n\n[...]\n\n{paragraphs[-1]}"
+            
+        except Exception as e:
+            # Fallback to simple truncation
+            print(f"Error summarizing AI message: {e}")
+            return full_response[:250] + "..." if len(full_response) > 250 else full_response
 
 async def main_test_rag_qdrant():
     print("Ensure QDRANT_URL and OPENAI_API_KEY are set in .env for this test.")
