@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Body, Request, Depends
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Body, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
@@ -56,7 +56,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.mygpt.work","https://www.druidx.co"],
+    allow_origins=["https://www.mygpt.work","https://www.druidx.co", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
@@ -79,7 +79,7 @@ os.makedirs(TEMP_DOWNLOAD_PATH, exist_ok=True)
 
 # --- Pydantic Models ---
 class BaseRAGRequest(BaseModel):
-    user_email: str
+    user_id: str
     gpt_id: str
     gpt_name: Optional[str] = "default_gpt"
 
@@ -116,7 +116,7 @@ class FileUploadInfoResponse(BaseModel):
     error_message: Optional[str] = None
 
 class GptOpenedRequest(BaseModel):
-    user_email: str
+    user_id: str
     gpt_id: str
     gpt_name: str
     file_urls: List[str] = []
@@ -125,12 +125,13 @@ class GptOpenedRequest(BaseModel):
     api_keys: Optional[Dict[str, str]] = Field(default_factory=dict)
 
 # --- Helper Functions ---
-def get_session_id(user_email: str, gpt_id: str) -> str:
-    email_part = user_email.replace('@', '_').replace('.', '_')
-    return f"user_{email_part}_gpt_{gpt_id}"
+def get_session_id(user_id: str, gpt_id: str) -> str:
+    # user_id is expected to be a safe string for session IDs.
+    # No replacement needed like for emails.
+    return f"user_{user_id}_gpt_{gpt_id}"
 
 async def get_or_create_rag_instance(
-    user_email: str,
+    user_id: str,
     gpt_id: str,
     gpt_name: Optional[str] = "default_gpt",
     default_model: Optional[str] = None,
@@ -141,7 +142,65 @@ async def get_or_create_rag_instance(
     api_keys: Optional[Dict[str, str]] = None
 ) -> EnhancedRAG:
     async with sessions_lock:
-        if gpt_id not in active_rag_sessions:
+        if gpt_id in active_rag_sessions:
+            rag_instance = active_rag_sessions[gpt_id]
+            
+            # Update MCP configuration if provided
+            if initial_mcp_enabled_config is not None:
+                rag_instance.mcp_enabled = initial_mcp_enabled_config
+                if initial_mcp_schema_config:
+                    try:
+                        schema = json.loads(initial_mcp_schema_config)
+                        if isinstance(schema, dict) and "mcpServers" in schema:
+                            rag_instance.mcp_servers_config = schema["mcpServers"]
+                            rag_instance.gpt_mcp_full_schema_str = initial_mcp_schema_config
+                            print(f"✅ Updated MCP configuration with servers: {list(rag_instance.mcp_servers_config.keys())}")
+                    except json.JSONDecodeError as e:
+                        print(f"⚠️ Failed to update MCP schema: {e}")
+            
+            # Update other configurations...
+            if default_model:
+                rag_instance.default_llm_model_name = default_model
+            if default_system_prompt:
+                rag_instance.default_system_prompt = default_system_prompt
+            if default_use_hybrid_search is not None:
+                rag_instance.default_use_hybrid_search = default_use_hybrid_search
+                
+            # Update API keys if a RAG instance already exists
+            if api_keys:
+                # Update OpenAI API key if provided
+                if 'openai' in api_keys and api_keys['openai']:
+                    old_key = rag_instance.openai_api_key
+                    new_key = api_keys['openai']
+                    if old_key != new_key:
+                        rag_instance.openai_api_key = new_key
+                        # Update OpenAI client with new key
+                        if hasattr(rag_instance, "async_openai_client"):
+                            # Try to reinitialize OpenAI client with new key
+                            try:
+                                import httpx
+                                from openai import AsyncOpenAI
+                                timeout_config = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
+                                rag_instance.async_openai_client = AsyncOpenAI(
+                                    api_key=new_key,
+                                    timeout=timeout_config,
+                                    max_retries=1
+                                )
+                                print(f"✅ OpenAI client reinitialized with user-provided API key")
+                            except Exception as e:
+                                print(f"❌ Error reinitializing OpenAI client: {e}")
+                
+                # Update other API keys similarly if they exist in the instance
+                for key_name in ['claude', 'gemini', 'groq', 'tavily', 'openrouter']:
+                    if key_name in api_keys and api_keys[key_name] and hasattr(rag_instance, f"{key_name}_api_key"):
+                        attr_name = f"{key_name}_api_key"
+                        if getattr(rag_instance, attr_name) != api_keys[key_name]:
+                            setattr(rag_instance, attr_name, api_keys[key_name])
+                            print(f"✅ Updated {key_name} API key for RAG instance {gpt_id}")
+                
+            print(f"Reusing EnhancedRAG instance for gpt_id: {gpt_id}. Updated defaults and API keys if provided.")
+
+        else:
             print(f"Creating new EnhancedRAG instance for gpt_id: {gpt_id}")
             
             # Use API keys from frontend if available, otherwise fallback to environment
@@ -229,48 +288,6 @@ async def get_or_create_rag_instance(
                     if getattr(rag_instance, attr_name) != api_keys[key_name]:
                         setattr(rag_instance, attr_name, api_keys[key_name])
                         print(f"✅ Updated {key_name} API key for RAG instance {gpt_id}")
-        else:
-            rag_instance = active_rag_sessions[gpt_id]
-            if default_model:
-                rag_instance.default_llm_model_name = default_model
-            if default_system_prompt:
-                rag_instance.default_system_prompt = default_system_prompt
-            if default_use_hybrid_search is not None:
-                rag_instance.default_use_hybrid_search = default_use_hybrid_search
-                
-            # Update API keys if a RAG instance already exists
-            if api_keys:
-                # Update OpenAI API key if provided
-                if 'openai' in api_keys and api_keys['openai']:
-                    old_key = rag_instance.openai_api_key
-                    new_key = api_keys['openai']
-                    if old_key != new_key:
-                        rag_instance.openai_api_key = new_key
-                        # Update OpenAI client with new key
-                        if hasattr(rag_instance, "async_openai_client"):
-                            # Try to reinitialize OpenAI client with new key
-                            try:
-                                import httpx
-                                from openai import AsyncOpenAI
-                                timeout_config = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
-                                rag_instance.async_openai_client = AsyncOpenAI(
-                                    api_key=new_key,
-                                    timeout=timeout_config,
-                                    max_retries=1
-                                )
-                                print(f"✅ OpenAI client reinitialized with user-provided API key")
-                            except Exception as e:
-                                print(f"❌ Error reinitializing OpenAI client: {e}")
-                
-                # Update other API keys similarly if they exist in the instance
-                for key_name in ['claude', 'gemini', 'groq', 'tavily', 'openrouter']:
-                    if key_name in api_keys and api_keys[key_name] and hasattr(rag_instance, f"{key_name}_api_key"):
-                        attr_name = f"{key_name}_api_key"
-                        if getattr(rag_instance, attr_name) != api_keys[key_name]:
-                            setattr(rag_instance, attr_name, api_keys[key_name])
-                            print(f"✅ Updated {key_name} API key for RAG instance {gpt_id}")
-                
-            print(f"Reusing EnhancedRAG instance for gpt_id: {gpt_id}. Updated defaults and API keys if provided.")
 
         return active_rag_sessions[gpt_id]
 
@@ -313,13 +330,13 @@ async def _process_uploaded_file_to_r2(
 
 @app.post("/setup-gpt-context", summary="Initialize/update a GPT's knowledge base from URLs and set defaults")
 async def setup_gpt_context_endpoint(request: GptContextSetupRequest, background_tasks: BackgroundTasks):
-    print(f"Received setup GPT context request for GPT ID: {request.gpt_id}, User: {request.user_email}")
+    print(f"Received setup GPT context request for GPT ID: {request.gpt_id}, User: {request.user_id}")
     print(f"KB URLs: {request.kb_document_urls}, Model: {request.default_model}, Prompt: {request.default_system_prompt}, Hybrid: {request.default_use_hybrid_search}")
     print(f"MCP Enabled Config: {request.mcp_enabled_config}, MCP Schema Config Present: {bool(request.mcp_schema_config)}")
 
     try:
         rag_instance = await get_or_create_rag_instance(
-            request.user_email,
+            request.user_id,
             request.gpt_id,
             request.gpt_name,
             default_model=request.default_model,
@@ -354,7 +371,7 @@ async def setup_gpt_context_endpoint(request: GptContextSetupRequest, background
 async def upload_documents_endpoint(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    user_email: str = Form(...),
+    user_id: str = Form(...),
     gpt_id: str = Form(...),
     is_user_document: str = Form("false"),
 ):
@@ -386,11 +403,11 @@ async def upload_documents_endpoint(
             "upload_results": [r.model_dump() for r in processing_results]
         })
 
-    rag_instance = await get_or_create_rag_instance(user_email=user_email, gpt_id=gpt_id)
+    rag_instance = await get_or_create_rag_instance(user_id=user_id, gpt_id=gpt_id)
     
-    async def _index_documents_task(rag: EnhancedRAG, keys_or_urls: List[str], is_user_specific: bool, u_email: str, g_id: str):
+    async def _index_documents_task(rag: EnhancedRAG, keys_or_urls: List[str], is_user_specific: bool, u_id: str, g_id: str):
         doc_type = "user-specific" if is_user_specific else "knowledge base"
-        s_id = get_session_id(u_email, g_id)
+        s_id = get_session_id(u_id, g_id)
         print(f"BG Task: Indexing {len(keys_or_urls)} {doc_type} documents for gpt_id '{g_id}' (session '{s_id}')...")
         try:
             if is_user_specific:
@@ -401,7 +418,7 @@ async def upload_documents_endpoint(
         except Exception as e:
             print(f"BG Task: Error indexing {doc_type} documents for gpt_id '{g_id}': {e}")
 
-    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_email, gpt_id)
+    background_tasks.add_task(_index_documents_task, rag_instance, r2_keys_or_urls_for_indexing, is_user_doc_bool, user_id, gpt_id)
 
     return JSONResponse(status_code=202, content={
         "message": f"{len(r2_keys_or_urls_for_indexing)} files accepted for {'user-specific' if is_user_doc_bool else 'knowledge base'} indexing. Processing in background.",
@@ -411,29 +428,35 @@ async def upload_documents_endpoint(
 @app.post("/chat-stream")
 async def chat_stream(request: ChatStreamRequest):
     try:
-        session_id = get_session_id(request.user_email, request.gpt_id)
+        session_id = get_session_id(request.user_id, request.gpt_id)
         
-        print(f"Chat stream request from {request.user_email} for GPT {request.gpt_id}")
+        print(f"Chat stream request from {request.user_id} for GPT {request.gpt_id}")
         print(f"MCP enabled: {request.mcp_enabled}")
         print(f"Web search enabled: {request.web_search_enabled}")
         
-        # Determine if this is a new chat (add this)
+        # Determine if this is a new chat
         is_new_chat = not request.history and not request.memory
-        if is_new_chat:
-            print(f"Starting new chat for session {session_id}")
         
+        # Parse and validate MCP configuration
+        mcp_schema_str = None
         if request.mcp_enabled and request.mcp_schema:
             try:
+                # Validate schema structure
                 mcp_config = json.loads(request.mcp_schema)
-                print(f"MCP config received - Command: {mcp_config.get('command', 'NOT_FOUND')}")
-                print(f"MCP config keys: {list(mcp_config.keys())}")
-            except Exception as e:
-                print(f"Error parsing MCP schema: {e}")
+                if "mcpServers" in mcp_config and isinstance(mcp_config["mcpServers"], dict):
+                    mcp_schema_str = request.mcp_schema
+                    print(f"✅ Valid MCP schema received with servers: {list(mcp_config['mcpServers'].keys())}")
+                else:
+                    print("⚠️ Invalid MCP schema structure")
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Error parsing MCP schema: {e}")
         
         rag = await get_or_create_rag_instance(
-            user_email=request.user_email,
+            user_id=request.user_id,
             gpt_id=request.gpt_id,
             gpt_name=request.gpt_name,
+            initial_mcp_enabled_config=request.mcp_enabled,
+            initial_mcp_schema_config=mcp_schema_str,
             api_keys=request.api_keys
         )
         
@@ -473,10 +496,10 @@ async def chat_stream(request: ChatStreamRequest):
 @app.post("/chat", summary="Handle non-streaming chat requests")
 async def chat_endpoint(request: ChatRequest):
     try:
-        session_id = get_session_id(request.user_email, request.gpt_id)
+        session_id = get_session_id(request.user_id, request.gpt_id)
         
         rag = await get_or_create_rag_instance(
-            user_email=request.user_email,
+            user_id=request.user_id,
             gpt_id=request.gpt_id,
             gpt_name=request.gpt_name,
             api_keys=request.api_keys
@@ -507,49 +530,48 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.post("/gpt-opened", summary="Notify backend when a GPT is opened, ensure context is set up.")
 async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: BackgroundTasks):
-    session_id = get_session_id(request.user_email, request.gpt_id)
-    print(f"GPT opened: ID={request.gpt_id}, Name='{request.gpt_name}', User={request.user_email}")
-    print(f"Config Schema provided: {bool(request.config_schema)}")
-    print(f"API Keys provided for context: {bool(request.api_keys)}")
-
-    gpt_model = None
-    gpt_instructions = None
-    gpt_mcp_enabled_config = False
-    gpt_mcp_schema_config_str = None
-
-    if request.config_schema:
-        gpt_model = request.config_schema.get("model")
-        gpt_instructions = request.config_schema.get("instructions")
-        # Extract full MCP config
-        gpt_mcp_enabled_config = request.config_schema.get("mcpEnabled", False)
-        mcp_schema_from_config = request.config_schema.get("mcpSchema")
-        
-        if mcp_schema_from_config is not None:
-            if isinstance(mcp_schema_from_config, str):
-                gpt_mcp_schema_config_str = mcp_schema_from_config
-            else: # If it's a dict/object, serialize it
-                try:
-                    gpt_mcp_schema_config_str = json.dumps(mcp_schema_from_config)
-                except Exception as e_ser:
-                    print(f"Warning: Could not serialize mcpSchema from config_schema to JSON string for GPT {request.gpt_id}: {e_ser}")
-                    gpt_mcp_schema_config_str = None
-        
-        print(f"  Model: {gpt_model}, HybridSearch: {request.use_hybrid_search}")
-        print(f"  MCP Enabled (from config_schema): {gpt_mcp_enabled_config}")
-        print(f"  MCP Schema (from config_schema) present: {bool(gpt_mcp_schema_config_str)}")
-
+    session_id = get_session_id(request.user_id, request.gpt_id)
+    print(f"GPT opened: ID={request.gpt_id}, Name='{request.gpt_name}', User={request.user_id}")
 
     try:
+        # Extract MCP configuration
+        mcp_enabled = False
+        mcp_schema_str = None
+        
+        if request.config_schema:
+            # Get MCP configuration
+            mcp_enabled = request.config_schema.get("mcpEnabled", False)
+            mcp_schema = request.config_schema.get("mcpSchema")
+            
+            if isinstance(mcp_schema, str):
+                try:
+                    # Validate the schema is proper JSON
+                    json.loads(mcp_schema)
+                    mcp_schema_str = mcp_schema
+                except json.JSONDecodeError:
+                    print(f"Warning: Invalid MCP schema JSON string provided")
+                    mcp_schema_str = None
+            elif isinstance(mcp_schema, dict):
+                try:
+                    mcp_schema_str = json.dumps(mcp_schema)
+                except Exception as e:
+                    print(f"Warning: Could not serialize MCP schema dict to JSON: {e}")
+                    mcp_schema_str = None
+
+            print(f"MCP Configuration: enabled={mcp_enabled}, schema_valid={bool(mcp_schema_str)}")
+            if mcp_schema_str:
+                print(f"Available MCP servers: {list(json.loads(mcp_schema_str).get('mcpServers', {}).keys())}")
+
         rag_instance = await get_or_create_rag_instance(
-            user_email=request.user_email,
+            user_id=request.user_id,
             gpt_id=request.gpt_id,
             gpt_name=request.gpt_name,
-            default_model=gpt_model,
-            default_system_prompt=gpt_instructions,
-            default_use_hybrid_search=request.use_hybrid_search, # From GptOpenedRequest directly
-            initial_mcp_enabled_config=gpt_mcp_enabled_config, # Full MCP config
-            initial_mcp_schema_config=gpt_mcp_schema_config_str, # Full MCP schema
-            api_keys=request.api_keys # API keys passed from frontend user settings
+            default_model=request.config_schema.get("model") if request.config_schema else None,
+            default_system_prompt=request.config_schema.get("instructions") if request.config_schema else None,
+            default_use_hybrid_search=request.use_hybrid_search,
+            initial_mcp_enabled_config=mcp_enabled,
+            initial_mcp_schema_config=mcp_schema_str,
+            api_keys=request.api_keys
         )
 
         async def _process_kb_urls_task(urls: List[str], rag: EnhancedRAG):
@@ -565,7 +587,7 @@ async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: Backg
         
         return JSONResponse(content={
             "success": True,
-            "message": f"GPT '{request.gpt_name}' context initialized/updated for user {request.user_email}.",
+            "message": f"GPT '{request.gpt_name}' context initialized/updated for user {request.user_id}.",
             "collection_name": rag_instance.kb_collection_name,
             "session_id": session_id,
             "mcp_config_loaded": {
@@ -582,7 +604,7 @@ async def gpt_opened_endpoint(request: GptOpenedRequest, background_tasks: Backg
 @app.post("/upload-chat-files", summary="Upload files for chat including images")
 async def upload_chat_files_endpoint(
     files: List[UploadFile] = File(...),
-    user_email: str = Form(...),
+    user_id: str = Form(...),
     gpt_id: str = Form(...),
     gpt_name: str = Form(...),
     collection_name: str = Form(...),
@@ -616,13 +638,13 @@ async def upload_chat_files_endpoint(
         processing_results.append(result)
 
     rag_instance = await get_or_create_rag_instance(
-        user_email=user_email, 
+        user_id=user_id, 
         gpt_id=gpt_id,
         gpt_name=gpt_name
     )
     
     if file_urls:
-        session_id = get_session_id(user_email, gpt_id)
+        session_id = get_session_id(user_id, gpt_id)
         
         try:
             if is_user_doc_bool:
@@ -706,7 +728,7 @@ async def index_knowledge_endpoint(
         data = await request.json()
         gpt_id = data.get("gpt_id")
         file_urls = data.get("file_urls", [])
-        user_email = data.get("user_email", "user@example.com")
+        user_id = data.get("user_id", "user_example_id")
         system_prompt = data.get("system_prompt", "")
         use_hybrid_search = data.get("use_hybrid_search", False)
         schema = data.get("schema", {})
@@ -719,7 +741,7 @@ async def index_knowledge_endpoint(
         
         # Initialize RAG instance
         rag_instance = await get_or_create_rag_instance(
-            user_email=user_email,
+            user_id=user_id,
             gpt_id=gpt_id,
             gpt_name=schema.get("name", "Custom GPT"),
             default_model=schema.get("model"),
